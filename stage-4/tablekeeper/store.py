@@ -16,16 +16,19 @@ import secrets
 from . import passwords, timeutil
 from .errors import malformed, validation
 
-SCHEMA = 3                 # stage 3; schemas 1 and 2 (earlier exports) are upgraded on import
-SCHEMAS = (1, 2, 3)
+SCHEMA = 4                 # stage 4; schemas 1-3 (earlier exports) are upgraded on import
+SCHEMAS = (1, 2, 3, 4)
 MAX_ID = 64
 MAX_KEY = 255
 REFERENCE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 REFERENCE_LENGTH = 8
 STATUSES = ("confirmed", "cancelled")
-EVENTS = ("created", "changed", "cancelled")
+EVENTS = ("created", "changed", "cancelled", "reassigned")
 IDEMPOTENT_PATHS = ("/reservations", "/reservation-moves", "/series")
-_POLICY_PATH_RE = re.compile(r"/restaurants/.{1,64}/policies", re.DOTALL)
+# Idempotent write paths with ids in them: policies (stage 3), replans and series amend (stage 4).
+_POLICY_PATH_RE = re.compile(
+    r"/restaurants/.{1,64}/(policies|replans|replans/.{1,80}/apply)|/series/.{1,80}/amend",
+    re.DOTALL)
 _REFERENCE_RE = re.compile(r"[A-Z0-9]{6,12}")
 STAGE1_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_id",
                  "party_size", "status", "starts_at_local", "starts_at",
@@ -406,6 +409,8 @@ class State:
         self.references: dict[str, str] = {}
         self.idempotency: dict[tuple[str, str, str, str], dict] = {}
         self.series: dict = {}
+        self.plans: dict[str, dict] = {}            # plan id -> stored replan (S4-R2)
+        self.closures: dict[str, list] = {}         # restaurant id -> applied closures
         self.seq = 0
 
     # -- identifiers -------------------------------------------------------
@@ -456,6 +461,7 @@ class State:
 
     def export(self) -> dict:
         from . import series  # late: series.py builds on this module
+        from .extras import state as extras_state
         return {
             "schema": SCHEMA,
             "seq": self.seq,
@@ -476,7 +482,61 @@ class State:
                 for scope, record in self.idempotency.items()
             ],
             "series": series.export_records(self),
+            "plans": [export_plan(plan) for plan in self.plans.values()],
+            "closures": {rid: [{"table_id": c["table_id"], "from": c["from"], "to": c["to"],
+                                "plan_id": c["plan_id"]} for c in items]
+                         for rid, items in self.closures.items()},
+            "extras": extras_state.export_state(self),
         }
+
+
+# -- plans and closures (stage 4) --------------------------------------------------
+
+PLAN_FIELDS = ("plan_id", "restaurant_id", "restaurant_revision", "closure", "assignments",
+               "moved_count", "unused_seats", "applied")
+
+
+def export_plan(plan: dict) -> dict:
+    return {field: copy.deepcopy(plan[field]) for field in PLAN_FIELDS}
+
+
+def closure_record(table_id, from_text, to_text, plan_id) -> dict:
+    return {"table_id": table_id, "from": from_text, "to": to_text, "plan_id": plan_id,
+            "start": timeutil.parse_rfc3339(from_text), "end": timeutil.parse_rfc3339(to_text)}
+
+
+def _import_plans_and_closures(raw, state) -> None:
+    plans = raw.get("plans")
+    _require(isinstance(plans, list), "plans must be a list")
+    for plan in plans:
+        _require(isinstance(plan, dict) and set(plan) == set(PLAN_FIELDS), "plan fields")
+        _require(valid_id(plan["plan_id"]) and plan["plan_id"] not in state.plans, "plan id")
+        _require(plan["restaurant_id"] in state.restaurants, "plan restaurant")
+        _require(is_int(plan["restaurant_revision"]) and plan["restaurant_revision"] >= 0,
+                 "plan restaurant_revision")
+        closure = plan["closure"]
+        _require(isinstance(closure, dict) and set(closure) == {"table_id", "from", "to"}
+                 and timeutil.parse_rfc3339(closure["from"]) is not None
+                 and timeutil.parse_rfc3339(closure["to"]) is not None, "plan closure")
+        _require(isinstance(plan["assignments"], list)
+                 and all(isinstance(a, dict) and set(a) == {"reference", "table_ids", "changed"}
+                         for a in plan["assignments"]), "plan assignments")
+        _require(is_int(plan["moved_count"]) and is_int(plan["unused_seats"])
+                 and isinstance(plan["applied"], bool), "plan counters")
+        state.plans[plan["plan_id"]] = copy.deepcopy(plan)
+    closures = raw.get("closures")
+    _require(isinstance(closures, dict), "closures must be an object")
+    for rid, items in closures.items():
+        restaurant = state.restaurants.get(rid)
+        _require(restaurant is not None and isinstance(items, list), "closures restaurant")
+        for item in items:
+            _require(isinstance(item, dict) and set(item) == {"table_id", "from", "to", "plan_id"}
+                     and item["table_id"] in restaurant.table_index
+                     and isinstance(item["plan_id"], str), "closure fields")
+            record = closure_record(item["table_id"], item["from"], item["to"], item["plan_id"])
+            _require(record["start"] is not None and record["end"] is not None
+                     and record["start"] < record["end"], "closure interval")
+            state.closures.setdefault(rid, []).append(record)
 
 
 # -- builders ------------------------------------------------------------------
@@ -647,8 +707,11 @@ def _check_history(history, public) -> None:
         _require(is_int(entry.get("revision")) and entry["revision"] >= 1,
                  "history revision invalid")
         _check_terms(entry.get("accepted_terms"))
-        _require(set(entry) == {"seq", "at", "event", "changes", "revision", "accepted_terms"},
-                 "history entry has unexpected fields")
+        expected = {"seq", "at", "event", "changes", "revision", "accepted_terms"}
+        if entry.get("event") == "reassigned":
+            expected = expected | {"plan_id"}
+            _require(isinstance(entry.get("plan_id"), str), "reassigned entries carry a plan_id")
+        _require(set(entry) == expected, "history entry has unexpected fields")
     _require(history[0]["event"] == "created", "history starts with created")
     _require(history[-1]["revision"] == public["revision"],
              "history ends at the current revision")
@@ -725,7 +788,7 @@ def build_from_export(document) -> State:
 
         reservations = raw.get("reservations")
         _require(isinstance(reservations, list), "reservations must be a list")
-        fields = {1: STAGE1_FIELDS, 2: STAGE2_FIELDS, 3: STAGE3_FIELDS}[schema]
+        fields = {1: STAGE1_FIELDS, 2: STAGE2_FIELDS, 3: STAGE3_FIELDS, 4: STAGE3_FIELDS}[schema]
         for entry in reservations:
             _require(isinstance(entry, dict), "reservation must be an object")
             public = {}
@@ -812,6 +875,10 @@ def build_from_export(document) -> State:
 
         from . import series  # late: series.py builds on this module
         series.import_records(copy.deepcopy(raw.get("series")) if schema >= 3 else None, state)
+        if schema >= 4:
+            _import_plans_and_closures(raw, state)
+        from .extras import state as extras_state
+        extras_state.import_state(copy.deepcopy(raw.get("extras")) if schema >= 4 else None, state)
         return state
     except InvalidState as exc:
         raise validation(str(exc)) from None

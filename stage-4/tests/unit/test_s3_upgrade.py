@@ -132,7 +132,7 @@ def _stage3_document():
 def test_stage_3_round_trip_keeps_everything():
     svc, token, pub, a, b = _stage3_document()
     document = svc.export_state()
-    assert document["state"]["schema"] == 3
+    assert document["state"]["schema"] == 4
     target = Service(clock=Clock())
     target.import_state(json.loads(json.dumps(document)))
     assert target.export_state() == document
@@ -158,7 +158,7 @@ def _mutations(document):
         return state["reservations"][i]
 
     return [
-        edit(lambda s: s.update(schema=4)),
+        edit(lambda s: s.update(schema=5)),
         edit(lambda s: res(s).update(revision=0)),
         edit(lambda s: res(s).update(revision=True)),
         edit(lambda s: res(s).pop("accepted_terms")),
