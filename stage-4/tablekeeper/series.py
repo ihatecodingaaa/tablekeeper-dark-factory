@@ -9,14 +9,16 @@ A series is a record in ``state.series``::
 Occurrences are ordinary reservations. The record only remembers which bookings
 belong together, the local date each occurrence was scheduled for (it stays put
 when a booking is later moved), which of them a diner changed individually
-(exceptions) and the series revision. Every function here runs inside the service lock. New occurrences
-are planned and inserted through the core's own booking hooks, so they follow the
-same policy, opening-hours, DST and occupancy rules as any other new booking.
+(exceptions) and the series revision. Every function here runs inside the service
+lock. Occurrences are planned, inserted and changed through the core's own booking
+hooks, so they follow the same policy, opening-hours, DST and occupancy rules as
+any other booking.
 """
 from __future__ import annotations
 
 import copy
 import datetime as dt
+import re
 import secrets
 
 from . import store, timeutil
@@ -27,6 +29,7 @@ MIN_INTERVAL, MAX_INTERVAL = 1, 4
 _RECORD_FIELDS = frozenset({"series_id", "user_id", "interval_weeks", "revision", "occurrences"})
 _OCCURRENCE_FIELDS = frozenset({"index", "reservation_id", "reference", "scheduled_date",
                                 "exception"})
+_LOCAL_TIME = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]")
 
 
 # -- writes and reads (called by Service) ------------------------------------------
@@ -88,6 +91,61 @@ def create_series(svc, user_id, idempotency_key, body: dict) -> tuple[int, dict]
         return 201, response
 
 
+def amend_series(svc, user_id, series_id, idempotency_key, body: dict) -> tuple[int, dict]:
+    """POST /series/{id}/amend: move every eligible occurrence to a new local time, all or nothing.
+
+    Eligible occurrences are those at or after from_index that are neither cancelled
+    nor exceptions. Each keeps its scheduled date, tables and party size. Every
+    non-occupancy check runs first, in index order; occupancy is checked last, for
+    the changed occurrences together.
+    """
+    key = svc._check_key(idempotency_key)
+    canonical = store.canonical_json(body)
+    scope = (user_id, "POST", f"/series/{series_id}/amend", key)
+    with svc._lock:
+        state = svc._state
+        replay = svc._replay(state, scope, canonical)
+        if replay is not None:
+            return replay
+        expected_revision, from_index, local_time = _parse_amend(body)
+        record = state.series.get(series_id) if isinstance(series_id, str) else None
+        if record is None or record["user_id"] != user_id:
+            raise not_found("no such series")
+        if from_index >= len(record["occurrences"]):
+            raise validation("from_index must be below the number of occurrences")
+        if expected_revision != record["revision"]:
+            raise ApiError(409, "stale_revision", "the series changed since that revision")
+
+        hour, minute = int(local_time[:2]), int(local_time[3:])
+        changes = []  # (reservation, planned change), in index order
+        for occurrence in record["occurrences"][from_index:]:
+            reservation = state.reservations[occurrence["reservation_id"]]
+            if occurrence["exception"] or not reservation.confirmed:
+                continue
+            day = dt.date.fromisoformat(occurrence["scheduled_date"])
+            naive = dt.datetime.combine(day, dt.time(hour, minute))
+            if timeutil.format_local(naive) == reservation.public["starts_at_local"]:
+                continue  # already at that time: a no-op keeps its terms
+            restaurant = state.restaurants[reservation.restaurant_id]
+            svc._check_cutoff(restaurant, reservation)  # against the OLD accepted terms
+            planned = svc._plan_change(state, reservation, naive)
+            if planned is not None:
+                changes.append((reservation, planned))
+
+        if changes:
+            restaurant_id = changes[0][0].restaurant_id
+            moving = tuple(reservation.id for reservation, _ in changes)
+            if svc._occupancy_conflict(state, restaurant_id, [p for _, p in changes], moving):
+                raise ApiError(409, "table_unavailable", "a table is taken at the new time")
+            for reservation, planned in changes:
+                svc._apply_change(state, reservation, planned)
+            record["revision"] += 1
+            svc._bump_restaurant_revision(state, restaurant_id)
+        response = _view(svc, state, record)
+        svc._remember(state, scope, canonical, 201, response)
+        return 201, response
+
+
 def get_series(svc, user_id, series_id) -> dict:
     """GET /series/{id}: current states; anyone but the owner, or no token, gets 404."""
     with svc._lock:
@@ -123,6 +181,18 @@ def on_moved(state, changed_reservations) -> None:
         record, occurrence = find(state, reservation.id)
         if record is not None:
             occurrence["exception"] = True
+            touched[record["series_id"]] = record
+    for record in touched.values():
+        record["revision"] += 1
+
+
+def on_reassigned(state, moved_reservations) -> None:
+    """A seating repair moved bookings: each affected series moves on once. Exceptions,
+    scheduled dates and identities stay as they are."""
+    touched = {}
+    for reservation in moved_reservations:
+        record, _ = find(state, reservation.id)
+        if record is not None:
             touched[record["series_id"]] = record
     for record in touched.values():
         record["revision"] += 1
@@ -207,6 +277,20 @@ def _parse_request(body: dict):
     if not _int_in(interval_weeks, MIN_INTERVAL, MAX_INTERVAL):
         raise validation(f"interval_weeks must be an integer from {MIN_INTERVAL} to {MAX_INTERVAL}")
     return anchor_reference, count, interval_weeks
+
+
+def _parse_amend(body: dict):
+    """S4-R6 step 5: a positive expected_revision, a non-negative from_index, HH:MM time."""
+    expected_revision = body.get("expected_revision")
+    from_index = body.get("from_index")
+    local_time = body.get("local_time")
+    if not store.is_int(expected_revision) or expected_revision < 1:
+        raise validation("expected_revision must be a positive integer")
+    if not store.is_int(from_index) or from_index < 0:
+        raise validation("from_index must be an integer of at least 0")
+    if not isinstance(local_time, str) or not _LOCAL_TIME.fullmatch(local_time):
+        raise validation("local_time must be HH:MM between 00:00 and 23:59")
+    return expected_revision, from_index, local_time
 
 
 def _int_in(value, low, high) -> bool:

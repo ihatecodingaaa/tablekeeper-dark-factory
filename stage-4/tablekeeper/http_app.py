@@ -155,6 +155,12 @@ ROUTES = [
         "POST": (lambda s, r: s.publish_policy(r.user_id, r.params[0], r.idempotency_key, r.body),
                  True, OBJECT),
     }),
+    (("restaurants", None, "replans"), {
+        "POST": (lambda s, r: s.replan_preview(r.user_id, r.params[0], r.idempotency_key, r.body),
+                 True, OBJECT)}),
+    (("restaurants", None, "replans", None, "apply"), {
+        "POST": (lambda s, r: s.replan_apply(r.user_id, r.params[0], r.params[1], r.idempotency_key,
+                                             r.body), True, OBJECT)}),
     (("availability",), {"GET": (lambda s, r: (200, s.availability(r.query)), False, NO_BODY)}),
     (("reservations",), {
         "GET": (lambda s, r: (200, s.list_reservations(r.user_id)), True, NO_BODY),
@@ -183,6 +189,9 @@ ROUTES = [
                  True, OBJECT)}),
     (("series", None), {
         "GET": (lambda s, r: (200, s.get_series(r.user_id, r.params[0])), OPTIONAL_AUTH, NO_BODY)}),
+    (("series", None, "amend"), {
+        "POST": (lambda s, r: s.amend_series(r.user_id, r.params[0], r.idempotency_key, r.body),
+                 True, OBJECT)}),
 ]
 
 

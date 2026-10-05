@@ -654,6 +654,7 @@
       var slotStart = Date.parse(slot.starts_at);
       return Object.keys(mine).some(function (reference) {
         var r = mine[reference];
+        if (r.status === "cancelled") return false;
         if (r.restaurant_id !== view.restaurant.id || reservationTableIds(r).indexOf(tableId) === -1) return false;
         var start = Date.parse(r.starts_at);
         var end = r.ends_at ? Date.parse(r.ends_at) : start + duration;
@@ -876,7 +877,19 @@
       setSubmitLabel(b, "Try again");
     }
 
-    function showConfirmed(b, reservation) {
+    /* The receipt (new or replayed) names the booking; what it looks like NOW comes from
+     * GET /reservations/{ref}: a seating repair may have moved it, or it may since have
+     * been cancelled. The reference shown is always the original one. */
+    function showConfirmed(b, receipt) {
+      return api("GET", "/reservations/" + encodeURIComponent(receipt.reference), { auth: true })
+        .then(function (res) { return res.ok && res.data ? res.data : receipt; },
+              function () { return receipt; })
+        .then(function (current) {
+          if (booking === b) return renderConfirmation(b, receipt.reference, current);
+        });
+    }
+
+    function renderConfirmation(b, reference, reservation) {
       var ids = reservationTableIds(reservation);
       var known = ids.every(function (id) { return findTable(b.restaurant, id); }) &&
         reservation.restaurant_id === b.restaurant.id;
@@ -884,16 +897,18 @@
       return restaurantReady.then(function (restaurant) {
         if (booking !== b) return;
         var r = restaurant || b.restaurant;
-        mine[reservation.reference] = reservation;
+        var cancelled = reservation.status === "cancelled";
+        mine[reference] = reservation;
         setChildren(b.status);
         setSubmitLabel(b, "Confirm booking");
         var section = h("section", {
           "class": "confirmation card", "data-testid": "confirmation", tabindex: "-1",
           role: "status", "aria-labelledby": "confirmation-title"
         },
-        h("p", { "class": "confirmation__badge", id: "confirmation-title" }, icon("check"), "Booking confirmed"),
+        h("p", { "class": "confirmation__badge" + (cancelled ? " confirmation__badge--cancelled" : ""), id: "confirmation-title" },
+          icon(cancelled ? "x" : "check"), cancelled ? "Booking since cancelled" : "Booking confirmed"),
         h("p", { "class": "confirmation__label" }, "Your reference"),
-        h("p", { "class": "confirmation__reference", "data-testid": "confirmation-reference" }, reservation.reference),
+        h("p", { "class": "confirmation__reference", "data-testid": "confirmation-reference" }, reference),
         h("div", { "class": "confirmation__details", "data-testid": "confirmation-details" },
           h("p", { "class": "confirmation__restaurant" }, r.name),
           h("p", { "data-testid": "confirmation-tables" }, tablesLabel(r, ids)),
@@ -901,7 +916,7 @@
           h("p", null, guests(reservation.party_size))),
         h("p", { "class": "confirmation__note" },
           "Keep this reference to look up or cancel your booking. ",
-          h("a", { href: "/lookup?reference=" + encodeURIComponent(reservation.reference) }, "Manage booking")));
+          h("a", { href: "/lookup?reference=" + encodeURIComponent(reference) }, "Manage booking")));
         setChildren(b.confirmation, section);
         reveal(section);
         if (view) runSearch(view.query, true);
