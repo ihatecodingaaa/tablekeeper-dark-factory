@@ -23,7 +23,7 @@ from .errors import ApiError, malformed, not_found, unauthenticated, validation
 
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+")
 _BEARER_RE = re.compile(r"[Bb][Ee][Aa][Rr][Ee][Rr][ \t]+([^\s]+)")
-_PATCH_FIELDS = ("table_id", "starts_at_local", "party_size")
+_PATCH_FIELDS = ("table_id", "table_ids", "starts_at_local", "party_size")
 
 
 def _utc_now() -> dt.datetime:
@@ -31,13 +31,13 @@ def _utc_now() -> dt.datetime:
 
 
 class _Booking:
-    """Validated booking fields: restaurant, table, local start and party size."""
+    """Validated booking fields: restaurant, table set, local start and party size."""
 
-    __slots__ = ("restaurant", "table_id", "naive", "party_size", "start", "end")
+    __slots__ = ("restaurant", "table_ids", "naive", "party_size", "start", "end")
 
-    def __init__(self, restaurant, table_id, naive, party_size):
+    def __init__(self, restaurant, table_ids, naive, party_size):
         self.restaurant = restaurant
-        self.table_id = table_id
+        self.table_ids = list(table_ids)
         self.naive = naive
         self.party_size = party_size
         self.start = None
@@ -206,12 +206,20 @@ class Service:
                     continue
                 seen.add(local_text)
                 end = restaurant.end_of(start)
-                free = [t["id"] for t in restaurant.tables
-                        if t["capacity"] >= party_size
-                        and not any(s < end and start < e for s, e in busy.get(t["id"], ()))]
+                free = {t["id"] for t in restaurant.tables
+                        if not any(s < end and start < e for s, e in busy.get(t["id"], ()))}
+                singles = [t["id"] for t in restaurant.tables
+                           if t["id"] in free and t["capacity"] >= party_size]
+                options = [{"table_ids": [t], "capacity": restaurant.table_index[t]["capacity"]}
+                           for t in singles]
+                for pair in restaurant.combinable:
+                    capacity = restaurant.capacity_of(pair)
+                    if pair[0] in free and pair[1] in free and capacity >= party_size:
+                        options.append({"table_ids": list(pair), "capacity": capacity})
                 slots.append((start, {"starts_at_local": local_text,
                                       "starts_at": timeutil.to_rfc3339(start, restaurant.zone),
-                                      "available_table_ids": free}))
+                                      "available_table_ids": singles,
+                                      "available_options": options}))
         slots.sort(key=lambda item: item[0])
         return {"restaurant_id": restaurant.id, "date": day.isoformat(),
                 "timezone": restaurant.timezone, "slots": [s for _, s in slots]}
@@ -236,9 +244,14 @@ class Service:
         for reservation in state.reservations.values():
             if (reservation.confirmed and reservation.restaurant_id == restaurant_id
                     and reservation.id not in exclude):
-                busy.setdefault(reservation.table_id, []).append(
-                    (reservation.start, reservation.end))
+                for table_id in reservation.table_ids:
+                    busy.setdefault(table_id, []).append((reservation.start, reservation.end))
         return busy
+
+    @staticmethod
+    def _conflicts(busy, table_ids, start, end) -> bool:
+        """True when any member table has an overlapping confirmed booking."""
+        return any(s < end and start < e for t in table_ids for s, e in busy.get(t, ()))
 
     # -- booking validation (R2) -------------------------------------------------
 
@@ -248,6 +261,40 @@ class Service:
         for field in fields:
             if field in body and not isinstance(body[field], str):
                 raise malformed(f"{field} must be a string")
+
+    @staticmethod
+    def _check_table_types(body: dict) -> None:
+        """S2-R2 step 1: table_id must be a string, table_ids an array of strings."""
+        if "table_id" in body and not isinstance(body["table_id"], str):
+            raise malformed("table_id must be a string")
+        if "table_ids" in body:
+            value = body["table_ids"]
+            if not isinstance(value, list) or not all(isinstance(t, str) for t in value):
+                raise malformed("table_ids must be an array of strings")
+
+    def _requested_tables(self, body: dict, required: bool) -> list[str] | None:
+        """S2-R2 step 2 for the table fields; None when a change names no tables."""
+        has_one, has_set = "table_id" in body, "table_ids" in body
+        if has_one and has_set:
+            raise validation("send table_id or table_ids, not both")
+        if not has_one and not has_set:
+            if required:
+                raise validation("table_id or table_ids is required")
+            return None
+        ids = [body["table_id"]] if has_one else list(body["table_ids"])
+        if not ids:
+            raise validation("table_ids must not be empty")
+        for table_id in ids:
+            self._check_id("table_ids", table_id)
+        if len(set(ids)) != len(ids):
+            raise validation("table_ids must not repeat a table")
+        return ids
+
+    @staticmethod
+    def _check_set_size(ids) -> None:
+        """S2-R2 step 3: pairs only."""
+        if ids is not None and len(ids) > 2:
+            raise ApiError(422, "combination_not_allowed", "at most two tables can be combined")
 
     @staticmethod
     def _check_id(field: str, value) -> str:
@@ -271,11 +318,15 @@ class Service:
 
     @staticmethod
     def _check_rules(booking: _Booking) -> None:
-        """R2 steps 3-7 for fully parsed booking fields; sets start/end."""
+        """S2-R2 steps 4-6 for parsed booking fields; canonicalises tables, sets start/end."""
         restaurant = booking.restaurant
-        table = restaurant.table_index.get(booking.table_id)
-        if table is None:
-            raise not_found("no such table at this restaurant")
+        for table_id in booking.table_ids:
+            if table_id not in restaurant.table_index:
+                raise not_found("no such table at this restaurant")
+        canonical = restaurant.canonical_tables(booking.table_ids)
+        if canonical is None:
+            raise ApiError(422, "combination_not_allowed", "those tables cannot be combined")
+        booking.table_ids = canonical
         start = timeutil.resolve_local(booking.naive, restaurant.zone)
         if start is None:
             raise ApiError(422, "invalid_local_time", "that local time does not exist")
@@ -291,7 +342,7 @@ class Service:
             raise ApiError(422, "outside_opening_hours", "outside opening hours")
         if not any((minute - opens) % restaurant.slot_minutes == 0 for opens, _ in fitting):
             raise ApiError(422, "not_on_slot_grid", "start is not on the slot grid")
-        if booking.party_size > table["capacity"]:
+        if booking.party_size > restaurant.capacity_of(canonical):
             raise ApiError(422, "party_exceeds_capacity", "party exceeds table capacity")
         booking.start, booking.end = start, end
 
@@ -338,27 +389,29 @@ class Service:
             replay = self._replay(state, scope, canonical)
             if replay is not None:
                 return replay
-            self._check_types(body, ("restaurant_id", "table_id", "starts_at_local"))
-            for field in ("restaurant_id", "table_id", "starts_at_local", "party_size"):
+            self._check_types(body, ("restaurant_id", "starts_at_local"))
+            self._check_table_types(body)
+            for field in ("restaurant_id", "starts_at_local", "party_size"):
                 if field not in body:
                     raise validation(f"{field} is required")
+            ids = self._requested_tables(body, required=True)
             self._check_id("restaurant_id", body["restaurant_id"])
-            self._check_id("table_id", body["table_id"])
             party_size = self._parse_party_size(body["party_size"])
             naive = self._parse_starts_at_local(body["starts_at_local"])
+            self._check_set_size(ids)
             restaurant = state.restaurants.get(body["restaurant_id"])
             if restaurant is None:
                 raise not_found("no such restaurant")
-            booking = _Booking(restaurant, body["table_id"], naive, party_size)
+            booking = _Booking(restaurant, ids, naive, party_size)
             self._check_rules(booking)
-            busy = self._occupancy(state, restaurant.id).get(booking.table_id, ())
-            if any(s < booking.end and booking.start < e for s, e in busy):
+            busy = self._occupancy(state, restaurant.id)
+            if self._conflicts(busy, booking.table_ids, booking.start, booking.end):
                 raise ApiError(409, "table_unavailable", "table is taken at that time")
             public = {
                 "reservation_id": state.new_reservation_id(),
                 "reference": state.new_reference(),
                 "restaurant_id": restaurant.id,
-                "table_id": booking.table_id,
+                **store.table_fields(booking.table_ids),
                 "party_size": party_size,
                 "status": "confirmed",
                 "starts_at_local": timeutil.format_local(naive),
@@ -410,27 +463,29 @@ class Service:
         if not reservation.confirmed:
             raise ApiError(409, "reservation_cancelled", "reservation is cancelled")
         self._check_cutoff(restaurant, reservation)
-        self._check_types(change, ("table_id", "starts_at_local"))
+        self._check_types(change, ("starts_at_local",))
+        self._check_table_types(change)
         current = reservation.public
         party_size = (self._parse_party_size(change["party_size"])
                       if "party_size" in change else current["party_size"])
         naive = (self._parse_starts_at_local(change["starts_at_local"])
                  if "starts_at_local" in change
                  else timeutil.parse_local(current["starts_at_local"]))
-        table_id = (self._check_id("table_id", change["table_id"])
-                    if "table_id" in change else current["table_id"])
-        if (table_id == current["table_id"] and party_size == current["party_size"]
+        ids = self._requested_tables(change, required=False)
+        self._check_set_size(ids)
+        ids = list(reservation.table_ids) if ids is None else ids
+        if (set(ids) == set(reservation.table_ids) and party_size == current["party_size"]
                 and timeutil.format_local(naive) == current["starts_at_local"]):
             return None
-        booking = _Booking(restaurant, table_id, naive, party_size)
+        booking = _Booking(restaurant, ids, naive, party_size)
         self._check_rules(booking)
         return booking
 
     @staticmethod
     def _apply(reservation, booking: _Booking) -> None:
         zone = booking.restaurant.zone
+        store.set_tables(reservation.public, booking.table_ids)
         reservation.public.update({
-            "table_id": booking.table_id,
             "party_size": booking.party_size,
             "starts_at_local": timeutil.format_local(booking.naive),
             "starts_at": timeutil.to_rfc3339(booking.start, zone),
@@ -440,7 +495,8 @@ class Service:
 
     def amend_reservation(self, user_id, reference, body: dict) -> dict:
         """R4: 400 types, 404, 409 cancelled, 409 cutoff, R2 2-8; {} is a no-op."""
-        self._check_types(body, ("table_id", "starts_at_local"))
+        self._check_types(body, ("starts_at_local",))
+        self._check_table_types(body)
         change = {field: body[field] for field in _PATCH_FIELDS if field in body}
         with self._lock:
             state = self._state
@@ -448,9 +504,8 @@ class Service:
             booking = self._resolve_change(state, reservation, change)
             if booking is None:
                 return reservation.view()
-            busy = self._occupancy(state, reservation.restaurant_id,
-                                   exclude={reservation.id}).get(booking.table_id, ())
-            if any(s < booking.end and booking.start < e for s, e in busy):
+            busy = self._occupancy(state, reservation.restaurant_id, exclude={reservation.id})
+            if self._conflicts(busy, booking.table_ids, booking.start, booking.end):
                 raise ApiError(409, "table_unavailable", "table is taken at that time")
             self._apply(reservation, booking)
             return reservation.view()
@@ -492,16 +547,17 @@ class Service:
                 booking = self._resolve_change(state, reservation, change)
                 bookings.append(booking)
                 if booking is None:
-                    results.append((reservation.table_id, reservation.start, reservation.end))
+                    results.append((reservation.table_ids, reservation.start, reservation.end))
                 else:
-                    results.append((booking.table_id, booking.start, booking.end))
+                    results.append((booking.table_ids, booking.start, booking.end))
             listed = {r.id for r in reservations}
             busy = self._occupancy(state, reservations[0].restaurant_id, exclude=listed)
-            for i, (table_id, start, end) in enumerate(results):
-                if any(s < end and start < e for s, e in busy.get(table_id, ())):
+            for i, (table_ids, start, end) in enumerate(results):
+                if self._conflicts(busy, table_ids, start, end):
                     raise ApiError(409, "table_unavailable", "table is taken at that time")
-                for other_table, other_start, other_end in results[:i]:
-                    if other_table == table_id and other_start < end and start < other_end:
+                for other_tables, other_start, other_end in results[:i]:
+                    if (set(other_tables) & set(table_ids)
+                            and other_start < end and start < other_end):
                         raise ApiError(409, "table_unavailable", "moved bookings overlap")
             for reservation, booking in zip(reservations, bookings):
                 if booking is not None:

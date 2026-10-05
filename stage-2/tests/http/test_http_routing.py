@@ -21,11 +21,71 @@ def test_reset_returns_204_without_body(client):
 
 
 @pytest.mark.parametrize("path", [
-    "/", "/nope", "/health/", "/restaurants/", "/reservations/", "/reservations//cancel",
-    "/reservations/ABC/cancel/extra", "/auth", "/_test", "/RESTAURANTS",
+    "/nope", "/health/", "/restaurants/", "/reservations/", "/reservations//cancel",
+    "/reservations/ABC/cancel/extra", "/auth", "/_test", "/RESTAURANTS", "/assets",
+    "/assets/", "/lookup/ABC123", "/login/", "/index.html",
 ])
 def test_unknown_path_is_404_envelope(client, path):
     assert_error(client.request("GET", path), 404, "not_found")
+
+
+@pytest.mark.parametrize("path", ["/", "/signup", "/login", "/lookup"])
+def test_screen_routes_return_html(client, path):
+    resp = client.request("GET", path)
+    assert resp.status == 200, resp
+    assert resp.headers["content-type"] == "text/html; charset=utf-8"
+    assert resp.raw.startswith(b"<!doctype html>")
+    assert int(resp.headers["content-length"]) == len(resp.raw)
+    assert "default-src 'self'" in resp.headers["content-security-policy"]
+    assert resp.headers["x-content-type-options"] == "nosniff"
+    assert b'src="/assets/app.js"' in resp.raw
+
+
+def test_screen_routes_ignore_query_strings(client):
+    resp = client.request("GET", "/login?next=%2Flookup")
+    assert resp.status == 200 and resp.headers["content-type"].startswith("text/html")
+
+
+@pytest.mark.parametrize("method", ["POST", "PUT", "DELETE"])
+def test_screen_routes_only_answer_get(client, method):
+    resp = client.request(method, "/")
+    assert_error(resp, 405, "method_not_allowed")
+    assert resp.headers["allow"] == "GET"
+
+
+def test_search_page_lists_restaurants_escaped(client):
+    fixture = make_fixture()
+    fixture["restaurants"][0]["name"] = '<script>alert("x")</script> & Co'
+    assert client.request("POST", "/_test/reset", fixture).status == 204
+    page = client.request("GET", "/").raw.decode()
+    assert '<option value="r_anker">&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; Co</option>' in page
+    assert "<script>alert" not in page
+
+
+@pytest.mark.parametrize("name,content_type", [
+    ("app.js", "text/javascript; charset=utf-8"),
+    ("app.css", "text/css; charset=utf-8"),
+    ("icon.svg", "image/svg+xml"),
+])
+def test_assets_are_served_with_their_content_type(client, name, content_type):
+    resp = client.request("GET", f"/assets/{name}")
+    assert resp.status == 200
+    assert resp.headers["content-type"] == content_type
+    assert resp.raw and int(resp.headers["content-length"]) == len(resp.raw)
+
+
+@pytest.mark.parametrize("path", [
+    "/assets/missing.js", "/assets/..%2Fhttp_app.py", "/assets/%2E%2E%2Fservice.py",
+    "/assets/..%2F..%2Fweb%2Flayout.html", "/assets/app.js%00.css",
+])
+def test_unknown_or_escaping_assets_are_404(client, path):
+    assert_error(client.request("GET", path), 404, "not_found")
+
+
+def test_api_routes_stay_json_beside_the_screens(client):
+    resp = client.request("GET", "/restaurants")
+    assert resp.status == 200 and resp.headers["content-type"] == JSON_TYPE
+    assert "content-security-policy" not in resp.headers
 
 
 @pytest.mark.parametrize("method,path,allowed", [

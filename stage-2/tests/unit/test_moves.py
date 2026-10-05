@@ -19,7 +19,7 @@ def test_swap_two_bookings_between_tables(world):
     assert status == 201
     assert [r["reference"] for r in out["reservations"]] == [a["reference"], b["reference"]]
     assert [r["table_id"] for r in out["reservations"]] == ["t_2", "t_1"]
-    assert out["reservations"][0] == dict(a, table_id="t_2")
+    assert out["reservations"][0] == dict(a, table_id="t_2", table_ids=["t_2"])
     assert world.svc.get_reservation(world.ada, b["reference"])["table_id"] == "t_1"
     assert world.slots("2")["19:00"] == ["t_3"]
 

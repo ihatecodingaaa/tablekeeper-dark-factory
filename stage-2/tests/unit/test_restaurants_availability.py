@@ -17,7 +17,7 @@ def test_list_restaurants_fixture_order(clock):
 
 
 def test_get_restaurant_in_fixture_shape(world):
-    expected = restaurant()
+    expected = dict(restaurant(), combinable=[])
     assert world.svc.get_restaurant("r_anker") == expected
 
 
@@ -35,7 +35,7 @@ def test_slots_step_from_opens_and_end_by_closes(world):
     assert starts == [f"{DATE}T{h}" for h in
                       ("18:00", "18:30", "19:00", "19:30", "20:00", "20:30", "21:00", "21:30")]
     first = out["slots"][0]
-    assert set(first) == {"starts_at_local", "starts_at", "available_table_ids"}
+    assert set(first) == {"starts_at_local", "starts_at", "available_table_ids", "available_options"}
     assert first["starts_at"] == f"{DATE}T18:00:00+02:00"
     assert first["available_table_ids"] == ["t_1", "t_2", "t_3"]
 
