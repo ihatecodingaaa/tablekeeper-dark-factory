@@ -9,11 +9,11 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY tablekeeper ./tablekeeper
-COPY demo ./demo
+COPY vercel_seed.py ./vercel_seed.py
 
 RUN useradd --system --uid 10001 --no-create-home tablekeeper \
     && chown -R tablekeeper:tablekeeper /app
 
 USER tablekeeper
 
-CMD ["sh", "-c", "PORT=${PORT:-3000}; export PORT; python -m tablekeeper & pid=$!; seeded=0; for i in $(seq 1 40); do if python demo/seed_demo.py --base http://127.0.0.1:$PORT; then seeded=1; break; fi; sleep 0.25; done; [ \"$seeded\" = 1 ] || exit 1; wait $pid"]
+CMD ["sh", "-c", "PORT=${PORT:-3000}; export PORT; python -m tablekeeper & pid=$!; seeded=0; for i in $(seq 1 40); do if python vercel_seed.py --base http://127.0.0.1:$PORT; then seeded=1; break; fi; sleep 0.25; done; [ \"$seeded\" = 1 ] || exit 1; wait $pid"]
