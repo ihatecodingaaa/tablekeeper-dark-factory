@@ -16,7 +16,7 @@ def open_evening(page, ref):
 def test_signed_out_visitors_are_asked_to_sign_in(page, api):
     reservation, _ = booked(api)
     page.goto(f"/evening/{reservation['reference']}")
-    expect(page.get_by_role("link", name="Sign in")).to_have_attribute(
+    expect(page.get_by_test_id("evening-page").get_by_role("link", name="Sign in")).to_have_attribute(
         "href", f"/login?next=%2Fevening%2F{reservation['reference']}")
 
 

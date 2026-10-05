@@ -11,9 +11,9 @@ for entry in (STAGE_DIR, HERE, HERE.parent / "browser"):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
-from playwright.sync_api import expect, sync_playwright  # noqa: E402
+from playwright.sync_api import expect  # noqa: E402
 from tablekeeper.http_app import make_server  # noqa: E402
-from uikit import Api  # noqa: E402
+from uikit import Api, shared_browser  # noqa: E402
 
 expect.set_options(timeout=7000)
 
@@ -30,10 +30,7 @@ def base_url():
 
 @pytest.fixture(scope="session")
 def browser():
-    with sync_playwright() as pw:
-        chromium = pw.chromium.launch()
-        yield chromium
-        chromium.close()
+    return shared_browser()
 
 
 @pytest.fixture
