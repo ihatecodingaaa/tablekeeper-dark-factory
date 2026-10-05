@@ -24,6 +24,13 @@ import secrets
 from . import store, timeutil
 from .errors import ApiError, not_found, validation
 
+
+def _notify(name, svc, state, reservations, **context) -> None:
+    """Post-commit extras hook (notifications). Imported lazily: extras.views imports
+    this module. hooks.call never raises into the booking path."""
+    from .extras import hooks
+    hooks.call(name, svc, state, reservations, svc._now(), **context)
+
 MIN_COUNT, MAX_COUNT = 2, 12
 MIN_INTERVAL, MAX_INTERVAL = 1, 4
 _RECORD_FIELDS = frozenset({"series_id", "user_id", "interval_weeks", "revision", "occurrences"})
@@ -88,6 +95,7 @@ def create_series(svc, user_id, idempotency_key, body: dict) -> tuple[int, dict]
         state.series[record["series_id"]] = record
         response = _view(svc, state, record)
         svc._remember(state, scope, canonical, 201, response)
+        _notify("on_series_created", svc, state, occurrences, series_id=record["series_id"])
         return 201, response
 
 
@@ -143,6 +151,8 @@ def amend_series(svc, user_id, series_id, idempotency_key, body: dict) -> tuple[
             svc._bump_restaurant_revision(state, restaurant_id)
         response = _view(svc, state, record)
         svc._remember(state, scope, canonical, 201, response)
+        if changes:
+            _notify("on_series_amended", svc, state, [r for r, _ in changes], series_id=series_id)
         return 201, response
 
 
