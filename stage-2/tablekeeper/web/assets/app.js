@@ -38,6 +38,13 @@
     });
   }
 
+  /* Replace an element's children, skipping null/undefined/false entries
+   * (Element.replaceChildren would render those as text). */
+  function setChildren(el) {
+    while (el.firstChild) el.removeChild(el.firstChild);
+    append(el, Array.prototype.slice.call(arguments, 1));
+  }
+
   var ICONS = {
     plus: ["M12 5v14", "M5 12h14"],
     check: ["M5 12.5l4.5 4.5L19 7.5"],
@@ -423,7 +430,7 @@
       view = null;
       var iconName = kind === "error" ? "alert" : "calendar";
       results.setAttribute("aria-busy", "false");
-      results.replaceChildren(h("div", { "class": "state" + (kind === "error" ? " state--error" : "") },
+      setChildren(results, h("div", { "class": "state" + (kind === "error" ? " state--error" : "") },
         icon(iconName, "state__icon"),
         h("h2", { "class": "state__title", id: "results-heading" }, title),
         h("p", { "class": "state__text" }, text),
@@ -432,7 +439,7 @@
 
     function renderLoading() {
       results.setAttribute("aria-busy", "true");
-      results.replaceChildren(
+      setChildren(results, 
         h("div", { "class": "results__head" }, heading("Finding tables")),
         loadingLine("Checking which tables are free..."),
         h("div", { "class": "skeleton card", "aria-hidden": "true" },
@@ -489,7 +496,7 @@
         view.slots.length ? legend() : null);
 
       if (!view.slots.length) {
-        results.replaceChildren(head, h("div", { "class": "state", "data-testid": "no-slots" },
+        setChildren(results, head, h("div", { "class": "state", "data-testid": "no-slots" },
           icon("calendar", "state__icon"),
           h("h3", { "class": "state__title" }, "No tables on this day"),
           h("p", { "class": "state__text" }, restaurant.name + " isn't taking bookings on " +
@@ -532,17 +539,20 @@
           h("span", { "class": "grid__table-seats" }, "For larger parties")));
       }
 
-      results.replaceChildren(head,
+      var scroller = h("div", {
+        "class": "grid-scroll", role: "region", tabindex: "0",
+        "aria-label": "Availability at " + restaurant.name, "data-testid": "availability-grid"
+      }, h("table", { "class": "grid" },
+        h("caption", { "class": "visually-hidden" }, "Free tables at " + restaurant.name + " on " +
+          formatDate(view.date) + " for " + guests(view.partySize)),
+        h("thead", null, h("tr", null, columns)),
+        h("tbody", null, rows)));
+      var hint = h("p", { "class": "grid-hint", hidden: true }, "Swipe sideways to see every table.");
+      setChildren(results, head,
         anyFree ? null : notice("info", "info", "Fully booked for " + guests(view.partySize),
           "Every table is taken or too small at these times. Try another date or fewer guests."),
-        h("div", {
-          "class": "grid-scroll", role: "region", tabindex: "0",
-          "aria-label": "Availability at " + restaurant.name, "data-testid": "availability-grid"
-        }, h("table", { "class": "grid" },
-          h("caption", { "class": "visually-hidden" }, "Free tables at " + restaurant.name + " on " +
-            formatDate(view.date) + " for " + guests(view.partySize)),
-          h("thead", null, h("tr", null, columns)),
-          h("tbody", null, rows))));
+        hint, scroller);
+      if (scroller.scrollWidth > scroller.clientWidth + 1) hint.hidden = false;
     }
 
     function isSelected(slot, ids) {
@@ -624,7 +634,7 @@
 
     function closeBooking() {
       booking = null;
-      panel.replaceChildren();
+      setChildren(panel);
       workspace.classList.remove("workspace--booking");
       removeAuthError();
     }
@@ -665,7 +675,7 @@
         event.preventDefault();
         submitBooking(booking);
       });
-      panel.replaceChildren(form, confirmation);
+      setChildren(panel, form, confirmation);
       workspace.classList.add("workspace--booking");
       renderGrid();
       reveal(title);
@@ -675,10 +685,10 @@
       b.busy = busy;
       b.submit.disabled = busy;
       b.form.setAttribute("aria-busy", busy ? "true" : "false");
-      if (busy) b.submit.replaceChildren(icon("spinner", "spinner"), "Booking...");
+      if (busy) setChildren(b.submit, icon("spinner", "spinner"), "Booking...");
     }
 
-    function setSubmitLabel(b, text) { b.submit.replaceChildren(text); }
+    function setSubmitLabel(b, text) { setChildren(b.submit, text); }
 
     function submitBooking(b) {
       if (!b || b.busy) return;
@@ -752,14 +762,14 @@
     }
 
     function showBookingError(b, title, body) {
-      b.confirmation.replaceChildren();
-      b.status.replaceChildren(notice("error", "alert", title, body, "booking-error"));
+      setChildren(b.confirmation);
+      setChildren(b.status, notice("error", "alert", title, body, "booking-error"));
       setSubmitLabel(b, "Confirm booking");
     }
 
     function showUncertain(b) {
-      b.confirmation.replaceChildren();
-      b.status.replaceChildren(notice("uncertain", "question", "We couldn't confirm this booking",
+      setChildren(b.confirmation);
+      setChildren(b.status, notice("uncertain", "question", "We couldn't confirm this booking",
         "The connection dropped before Tablekeeper replied, so the table may or may not be booked. " +
         "Press \u201cTry again\u201d to check: it is safe and will never book twice.", "booking-uncertain"));
       setSubmitLabel(b, "Try again");
@@ -774,7 +784,7 @@
         if (booking !== b) return;
         var r = restaurant || b.restaurant;
         mine[reservation.reference] = reservation;
-        b.status.replaceChildren();
+        setChildren(b.status);
         setSubmitLabel(b, "Confirm booking");
         var section = h("section", {
           "class": "confirmation card", "data-testid": "confirmation", tabindex: "-1",
@@ -791,7 +801,7 @@
         h("p", { "class": "confirmation__note" },
           "Keep this reference to look up or cancel your booking. ",
           h("a", { href: "/lookup?reference=" + encodeURIComponent(reservation.reference) }, "Manage booking")));
-        b.confirmation.replaceChildren(section);
+        setChildren(b.confirmation, section);
         reveal(section);
         if (view) runSearch(view.query, true);
       });
@@ -818,12 +828,12 @@
 
     var current = session.get();
     if (current) {
-      messages.replaceChildren(notice("info", "info", null,
+      setChildren(messages, notice("info", "info", null,
         "You're signed in as " + (current.display_name || "a guest") + ". Signing in again switches account."));
     }
 
     function showError(title, body) {
-      messages.replaceChildren(notice("error", "alert", title, body, "auth-error"));
+      setChildren(messages, notice("error", "alert", title, body, "auth-error"));
     }
 
     form.addEventListener("submit", function (event) {
@@ -841,7 +851,7 @@
       }
       busy = true;
       submit.disabled = true;
-      submit.replaceChildren(icon("spinner", "spinner"), kind === "signup" ? "Creating account..." : "Signing in...");
+      setChildren(submit, icon("spinner", "spinner"), kind === "signup" ? "Creating account..." : "Signing in...");
       api("POST", kind === "signup" ? "/auth/signup" : "/auth/login", { body: body }).then(function (res) {
         if (res.ok && res.data && res.data.token) {
           session.set(res.data);
@@ -860,7 +870,7 @@
       }).finally(function () {
         busy = false;
         submit.disabled = false;
-        submit.replaceChildren(submitText);
+        setChildren(submit, submitText);
       });
     });
   }
@@ -883,7 +893,7 @@
     document.addEventListener("tk:signedout", function () {
       seq += 1;
       current = null;
-      out.replaceChildren();
+      setChildren(out);
     });
 
     var preset = new URLSearchParams(window.location.search).get("reference");
@@ -894,7 +904,7 @@
 
     function showError(title, body) {
       current = null;
-      out.replaceChildren(notice("error", "alert", title, body, "reservation-error"));
+      setChildren(out, notice("error", "alert", title, body, "reservation-error"));
     }
 
     function lookUp(reference) {
@@ -909,7 +919,7 @@
           [signInLink("/lookup?reference=" + encodeURIComponent(reference)), " to see the reservations made with your account."]);
         return;
       }
-      out.replaceChildren(loadingLine("Looking up " + reference + "..."));
+      setChildren(out, loadingLine("Looking up " + reference + "..."));
       api("GET", "/reservations/" + encodeURIComponent(reference), { auth: true }).then(function (res) {
         if (mySeq !== seq) return null;
         if (res.status === 401) {
@@ -952,7 +962,7 @@
       } else {
         actions = notice("info", "info", null, "This reservation is cancelled. The table is free for other guests.");
       }
-      out.replaceChildren(h("article", {
+      setChildren(out, h("article", {
         "class": "reservation card", "data-testid": "reservation-detail", "aria-labelledby": "reservation-heading"
       },
       h("div", { "class": "reservation__head" },
@@ -975,7 +985,7 @@
       var mySeq = seq;
       var r = current.reservation;
       button.disabled = true;
-      button.replaceChildren(icon("spinner", "spinner"), "Cancelling...");
+      setChildren(button, icon("spinner", "spinner"), "Cancelling...");
       api("POST", "/reservations/" + encodeURIComponent(r.reference) + "/cancel", { auth: true }).then(function (res) {
         if (mySeq !== seq) return;
         if (res.ok) {

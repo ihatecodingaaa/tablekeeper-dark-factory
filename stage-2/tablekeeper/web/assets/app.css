@@ -181,13 +181,19 @@ select.input { appearance: auto; }
 .results__refresh { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 0.9rem; }
 
 .legend { display: flex; flex-wrap: wrap; gap: 6px 14px; list-style: none; margin: 0; padding: 0; font-size: 0.85rem; color: var(--ink-soft); }
-.legend__item { display: inline-flex; align-items: center; gap: 6px; }
-.legend__swatch { width: 22px; height: 18px; border-radius: 5px; display: inline-grid; place-items: center; }
+.legend__item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.legend__swatch.cell { width: 24px; height: 20px; min-height: 0; padding: 0; border-radius: 5px; }
 .legend__swatch .icon { width: 12px; height: 12px; }
 
 .grid-scroll {
   max-width: 100%; overflow-x: auto; background: var(--surface);
   border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
+}
+.grid-hint { margin: 0 0 8px; font-size: 0.85rem; color: var(--muted); }
+.grid-hint[hidden] { display: none; }
+@media (max-width: 639px) {
+  .grid td { min-width: 88px; }
+  .cell { font-size: 0.84rem; padding: 6px; }
 }
 .grid { width: 100%; border-collapse: separate; border-spacing: 0; }
 .grid th, .grid td { padding: 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
