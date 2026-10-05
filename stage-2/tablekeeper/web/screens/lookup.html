@@ -1,0 +1,19 @@
+<section class="intro intro--compact">
+  <p class="eyebrow">Manage a booking</p>
+  <h1 class="intro__title">Look up a reservation</h1>
+  <p class="intro__lede">Enter the reference from your confirmation to see the booking or cancel it.</p>
+</section>
+
+<div class="lookup-layout">
+  <form class="lookup-bar card" id="lookup-form" novalidate>
+    <div class="field field--grow">
+      <label class="field__label" for="lookup-reference">Booking reference</label>
+      <input class="input input--reference" id="lookup-reference" name="reference" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="e.g. K3P7QW" data-testid="lookup-reference-input">
+    </div>
+    <div class="field field--action">
+      <button class="button button--primary button--block" type="submit" data-testid="lookup-submit">Find booking</button>
+    </div>
+  </form>
+  <div class="lookup-result" id="lookup-result"></div>
+</div>
+<p class="visually-hidden" id="lookup-announcer" role="status" aria-live="polite"></p>

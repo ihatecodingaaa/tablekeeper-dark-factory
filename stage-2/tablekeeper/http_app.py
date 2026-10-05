@@ -4,18 +4,93 @@ All domain behaviour lives in Service. This module maps HTTP onto it in a fixed
 order: route match (404, 405), authentication for protected routes (401), body
 parsing (400), then the service call. Every 4xx/5xx carries the envelope
 {"error": {"code": ..., "message": ...}}; 204 responses carry no body.
+
+The browser screens (/, /signup, /login, /lookup) are HTML pages composed from
+tablekeeper/web/; their scripts and styles are served from /assets/.
 """
 from __future__ import annotations
 
+import html
 import json
+import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .errors import ApiError, malformed, not_found
 from .service import Service
 
 JSON_TYPE = "application/json; charset=utf-8"
+HTML_TYPE = "text/html; charset=utf-8"
+WEB_DIR = Path(__file__).resolve().parent / "web"
+ASSET_TYPES = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".svg": "image/svg+xml",
+}
+NON_JSON_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"),
+}
+
+
+class Raw:
+    """A response body that is not JSON: an HTML page or a static asset."""
+
+    __slots__ = ("content_type", "data")
+
+    def __init__(self, content_type: str, data: bytes):
+        self.content_type = content_type
+        self.data = data
+
+
+def _load_assets() -> dict:
+    assets = {}
+    for path in sorted((WEB_DIR / "assets").iterdir()):
+        content_type = ASSET_TYPES.get(path.suffix)
+        if content_type and path.is_file():
+            assets[path.name] = Raw(content_type, path.read_bytes())
+    return assets
+
+
+ASSETS = _load_assets()
+LAYOUT = (WEB_DIR / "layout.html").read_text(encoding="utf-8")
+SCREENS = {name: (WEB_DIR / "screens" / f"{name}.html").read_text(encoding="utf-8")
+           for name in ("search", "signup", "login", "lookup")}
+TITLES = {"search": "Find a table", "signup": "Create an account", "login": "Sign in",
+          "lookup": "Look up a reservation"}
+_PLACEHOLDER = re.compile(r"\{\{([A-Z_]+)\}\}")
+
+
+def render_page(screen: str, values: dict | None = None) -> Raw:
+    """Fill the layout with one screen. `values` must already be escaped HTML."""
+    fills = dict(values or {})
+    content = _PLACEHOLDER.sub(lambda m: fills.get(m.group(1), ""), SCREENS[screen])
+    layout = {"TITLE": html.escape(TITLES[screen]), "SCREEN": screen, "CONTENT": content}
+    page = _PLACEHOLDER.sub(lambda m: layout.get(m.group(1), ""), LAYOUT)
+    return Raw(HTML_TYPE, page.encode("utf-8"))
+
+
+def _search_page(svc, rq):
+    # Restaurant options are rendered on the server, so the selector is usable
+    # before any script runs and the page itself makes no API call on load.
+    restaurants = svc.list_restaurants().get("restaurants", [])
+    options = "".join(
+        f'<option value="{html.escape(r["id"])}">{html.escape(r["name"])}</option>'
+        for r in restaurants)
+    return 200, render_page("search", {"RESTAURANT_OPTIONS": options})
+
+
+def _asset(svc, rq):
+    asset = ASSETS.get(rq.params[0])
+    if asset is None:
+        raise not_found("no such asset")
+    return 200, asset
 
 # Body handling per endpoint.
 NO_BODY = None   # any request body is ignored
@@ -56,6 +131,11 @@ def _import(svc, rq):
 # segment (passed to the endpoint, percent-decoded). Each method maps to
 # (endpoint, requires bearer token, body handling).
 ROUTES = [
+    (("",), {"GET": (_search_page, False, NO_BODY)}),
+    (("signup",), {"GET": (lambda s, r: (200, render_page("signup")), False, NO_BODY)}),
+    (("login",), {"GET": (lambda s, r: (200, render_page("login")), False, NO_BODY)}),
+    (("lookup",), {"GET": (lambda s, r: (200, render_page("lookup")), False, NO_BODY)}),
+    (("assets", None), {"GET": (_asset, False, NO_BODY)}),
     (("health",), {"GET": (_health, False, NO_BODY)}),
     (("_test", "reset"), {"POST": (_reset, False, ANY_JSON)}),
     (("_test", "export"), {"GET": (lambda s, r: (200, s.export_state()), False, NO_BODY)}),
@@ -212,7 +292,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _respond(self, status, body):
         data = None
-        if status != 204 and body is not None:
+        content_type = JSON_TYPE
+        if isinstance(body, Raw):
+            data, content_type = body.data, body.content_type
+            self._extra_headers.update(NON_JSON_HEADERS)
+        elif status != 204 and body is not None:
             try:
                 data = json.dumps(body, ensure_ascii=False, allow_nan=False,
                                   separators=(",", ":")).encode("utf-8")
@@ -225,7 +309,7 @@ class Handler(BaseHTTPRequestHandler):
             for name, value in self._extra_headers.items():
                 self.send_header(name, value)
             if data is not None:
-                self.send_header("Content-Type", JSON_TYPE)
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
             if self.close_connection:
                 self.send_header("Connection", "close")

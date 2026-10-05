@@ -1,0 +1,20 @@
+<section class="auth-layout">
+  <div class="auth card">
+    <p class="eyebrow">Welcome back</p>
+    <h1 class="auth__title">Sign in</h1>
+    <p class="auth__lede">Sign in to book a table or manage a reservation.</p>
+    <div class="auth__messages" id="auth-messages"></div>
+    <form class="stack" id="login-form" novalidate>
+      <div class="field">
+        <label class="field__label" for="login-email">Email</label>
+        <input class="input" id="login-email" name="email" type="email" autocomplete="email" data-testid="login-email">
+      </div>
+      <div class="field">
+        <label class="field__label" for="login-password">Password</label>
+        <input class="input" id="login-password" name="password" type="password" autocomplete="current-password" data-testid="login-password">
+      </div>
+      <button class="button button--primary button--block" type="submit" data-testid="login-submit">Sign in</button>
+    </form>
+    <p class="auth__switch">New to Tablekeeper? <a href="/signup">Create an account</a></p>
+  </div>
+</section>
