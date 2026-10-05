@@ -158,6 +158,20 @@
 .x-dialog__text { margin-top: 8px; color: var(--ink-soft); }
 .x-dialog__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 
+/* Search extras: Best Times and 409 recovery */
+.x-best { padding: 18px; margin-bottom: 16px; }
+.x-best__list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.x-best__item {
+  width: 100%; display: grid; gap: 2px; text-align: left; padding: 10px 12px; min-height: 44px; cursor: pointer;
+  background: #fff; border: 1.5px solid var(--accent); border-radius: var(--radius-small); color: var(--ink); font: inherit;
+}
+.x-best__item:hover { background: var(--accent-tint); }
+.x-best__time { font-weight: 700; color: var(--accent-strong); font-variant-numeric: tabular-nums; }
+.x-best__reasons { font-size: 0.85rem; color: var(--ink-soft); }
+.x-recovery { margin-top: 12px; }
+.x-recovery__title { display: flex; align-items: center; gap: 8px; font: 700 1rem/1.3 var(--sans); }
+.x-recovery__list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+
 .notice--offline { background: var(--stone); border-color: var(--line-strong); color: var(--ink); }
 .x-empty { text-align: center; }
 
