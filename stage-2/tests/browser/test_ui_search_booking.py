@@ -185,6 +185,9 @@ def test_lost_response_after_commit_is_uncertain_then_retry_recovers_original(pa
     uncertain = page.get_by_test_id("booking-uncertain")
     expect(uncertain).to_be_visible()
     assert uncertain.text_content().strip()
+    # It says how to check safely, and that changed details mean a new request.
+    expect(uncertain).to_contain_text("without changing anything")
+    expect(uncertain).to_contain_text("starts a new booking request")
     expect(page.get_by_test_id("booking-error")).to_have_count(0)
     expect(page.get_by_test_id("confirmation")).to_have_count(0)
     assert committed["reference"]
@@ -196,6 +199,55 @@ def test_lost_response_after_commit_is_uncertain_then_retry_recovers_original(pa
     expect(page.get_by_test_id("booking-error")).to_have_count(0)
     assert len(sent) == 2 and sent[0] == sent[1]
     assert len(api.reservations(api.login()["token"])) == 1
+
+
+def test_choosing_another_table_while_a_booking_is_pending_is_ignored(page, api):
+    sign_in(page)
+    page.goto("/")
+    search(page, future_date(), party_size=2)
+    page.get_by_test_id("slot-t_1-19:00").click()
+    held = []
+    page.route("**/reservations", lambda route: held.append(route))  # a slow server
+    page.get_by_test_id("booking-submit").click()
+    expect(page.get_by_test_id("booking-submit")).to_be_disabled()
+    other = page.get_by_test_id("slot-t_3-19:00")
+    expect(other).to_have_attribute("aria-disabled", "true")
+    other.click(force=True)  # deliver the click anyway: the pending form must stay
+    expect(page.get_by_test_id("booking-summary")).to_contain_text("Table 1")
+    assert len(held) == 1
+    held[0].continue_()
+    page.unroute("**/reservations")
+    expect(page.get_by_test_id("confirmation-tables")).to_contain_text("1")
+    expect(page.get_by_test_id("confirmation-reference")).to_have_text(REFERENCE)
+    expect(page.get_by_test_id("slot-t_3-19:00")).not_to_have_attribute("aria-disabled", "true")
+    booked = api.reservations(api.login()["token"])
+    assert [r["table_ids"] for r in booked] == [["t_1"]]
+
+
+def test_a_booking_reply_after_a_new_search_is_still_reflected(page, api):
+    sign_in(page)
+    date = future_date()
+    page.goto("/")
+    search(page, date, party_size=2)
+    page.get_by_test_id("slot-t_1-19:00").click()
+    held = []
+    page.route("**/reservations", lambda route: held.append(route))
+    page.get_by_test_id("booking-submit").click()
+    search(page, date, party_size=2)  # a new search closes the form while the request is out
+    expect(page.get_by_test_id("booking-form")).to_have_count(0)
+    expect(page.get_by_test_id("slot-t_1-19:00")).to_have_attribute("data-available", "true")
+    with page.expect_response(lambda r: "/availability" in r.url):
+        held[0].continue_()
+    page.unroute("**/reservations")
+    booked = api.reservations(api.login()["token"])
+    assert len(booked) == 1
+    cell = page.get_by_test_id("slot-t_1-19:00")
+    expect(cell).to_have_attribute("data-available", "false")
+    expect(cell).to_contain_text("Yours")
+    expect(page.get_by_text("Your earlier booking went through")).to_be_visible()
+    expect(page.get_by_role("link", name="Manage booking")).to_have_attribute(
+        "href", f"/lookup?reference={booked[0]['reference']}")
+    expect(page.get_by_test_id("confirmation")).to_have_count(0)
 
 
 def test_server_error_is_uncertain_not_a_refusal(page):

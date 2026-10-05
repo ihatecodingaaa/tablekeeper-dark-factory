@@ -6,8 +6,21 @@ from uikit import future_date, make_fixture, search, sign_in
 
 
 def no_horizontal_page_scroll(page):
-    return page.evaluate(
-        "() => document.documentElement.scrollWidth <= document.documentElement.clientWidth")
+    """The page is not scrolled sideways and has nothing to scroll sideways to."""
+    m = page.evaluate("""() => ({x: window.scrollX, left: document.scrollingElement.scrollLeft,
+        width: document.documentElement.scrollWidth, client: document.documentElement.clientWidth})""")
+    assert m["x"] == 0 and m["left"] == 0 and m["width"] <= m["client"], m
+    return True
+
+
+def assert_in_grid_view(page, testid):
+    """A cell inside the sideways-scrolling grid is within the grid's visible area."""
+    inside = page.evaluate("""(testid) => {
+        const cell = document.querySelector(`[data-testid="${testid}"]`).getBoundingClientRect();
+        const box = document.querySelector('[data-testid="availability-grid"]').getBoundingClientRect();
+        return cell.left >= box.left - 1 && cell.right <= box.right + 1;
+    }""", testid)
+    assert inside, f"{testid} is scrolled out of the grid's view"
 
 
 def test_upgrade_keeps_the_user_signed_in_and_recovers_a_lost_booking(page, api):
@@ -91,6 +104,77 @@ def test_booking_flow_fits_the_viewport(page, api, width):
     page.get_by_test_id("lookup-reference-input").fill(reference)
     page.get_by_test_id("lookup-submit").click()
     expect(page.get_by_test_id("reservation-detail")).to_be_visible()
+    assert no_horizontal_page_scroll(page)
+
+
+def test_every_booking_state_keeps_the_page_still_at_375(page, api):
+    """Rows without a free joined table, a far-right selection and every outcome state."""
+    bob = api.login("bob@example.com")["token"]
+    api.book(bob, "t_2", "19:00", key="bob-a")          # rows with no free pair
+    api.book(bob, "t_garden", "18:00", party_size=4, key="bob-b")
+    strict = api.book(api.login()["token"], "s_1", "19:00", restaurant="r_strict", key="ada-strict")
+    sign_in(page)
+    page.set_viewport_size({"width": 375, "height": 812})
+    page.goto("/")
+    search(page, future_date(), party_size=2)
+    expect(page.get_by_test_id("availability-grid")).to_be_visible()
+    assert no_horizontal_page_scroll(page)
+
+    page.get_by_test_id("slot-t_garden-20:00").click()           # the rightmost single table
+    expect(page.get_by_test_id("booking-form")).to_be_visible()
+    assert no_horizontal_page_scroll(page)
+    assert_in_grid_view(page, "slot-t_garden-20:00")
+
+    page.route("**/reservations", lambda route: route.abort())
+    page.get_by_test_id("booking-submit").click()
+    expect(page.get_by_test_id("booking-uncertain")).to_be_visible()
+    assert no_horizontal_page_scroll(page)
+    page.unroute("**/reservations")
+
+    api.book(bob, "t_garden", "20:00", key="bob-c")
+    with page.expect_response(lambda r: "/availability" in r.url):
+        page.get_by_test_id("booking-submit").click()
+    expect(page.get_by_test_id("booking-error")).to_be_visible()
+    assert no_horizontal_page_scroll(page)
+    # The refreshed grid kept its sideways scroll: the far-right column is still in view.
+    expect(page.get_by_test_id("slot-t_garden-20:00")).to_have_attribute("data-available", "false")
+    assert_in_grid_view(page, "slot-t_garden-20:00")
+
+    page.get_by_test_id("slot-t_3-20:30").click()
+    page.get_by_test_id("booking-submit").click()
+    expect(page.get_by_test_id("confirmation")).to_be_visible()
+    page.wait_for_timeout(400)  # let the confirmation finish scrolling into view
+    assert no_horizontal_page_scroll(page)
+    reference = page.get_by_test_id("confirmation-reference").text_content()
+
+    for ref in (reference, "NOPE0000", strict["reference"]):
+        page.goto("/lookup")
+        page.get_by_test_id("lookup-reference-input").fill(ref)
+        page.get_by_test_id("lookup-submit").click()
+        if ref == "NOPE0000":
+            expect(page.get_by_test_id("reservation-error")).to_be_visible()
+            assert no_horizontal_page_scroll(page)
+            continue
+        expect(page.get_by_test_id("reservation-detail")).to_be_visible()
+        assert no_horizontal_page_scroll(page)
+        page.get_by_test_id("reservation-cancel-button").click()
+        if ref == reference:
+            expect(page.get_by_test_id("reservation-status")).to_have_text("cancelled")
+        else:
+            expect(page.get_by_test_id("reservation-error")).to_be_visible()
+        assert no_horizontal_page_scroll(page)
+
+
+@pytest.mark.parametrize("testid", ["slot-t_3-20:00", "slot-t_2-18:00", "slot-t_garden-20:30",
+                                    "slot-t_1+t_2-19:00"])
+def test_a_selected_cell_is_fully_in_view_at_375(page, testid):
+    sign_in(page)
+    page.set_viewport_size({"width": 375, "height": 812})
+    page.goto("/")
+    search(page, future_date(), party_size=2)
+    page.get_by_test_id(testid).click()
+    expect(page.get_by_test_id(testid)).to_have_attribute("aria-pressed", "true")
+    assert_in_grid_view(page, testid)
     assert no_horizontal_page_scroll(page)
 
 

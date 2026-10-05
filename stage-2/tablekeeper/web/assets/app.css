@@ -98,7 +98,13 @@ main:focus { outline: none; }
 
 /* ---------- Page scaffolding ---------- */
 
-.page { flex: 1; width: 100%; max-width: 1160px; margin: 0 auto; padding: 32px 20px 56px; }
+/* The page never scrolls sideways: anything wider is clipped here (clip, unlike
+   hidden, is not a scroll container, so programmatic scrolling cannot shift it
+   and sticky elements keep working). Wide content scrolls in its own container. */
+.page {
+  position: relative; overflow-x: clip;
+  flex: 1; width: 100%; max-width: 1160px; margin: 0 auto; padding: 32px 20px 56px;
+}
 @media (max-width: 639px) { .page { padding: 20px 16px 40px; } }
 
 .site-footer { border-top: 1px solid var(--line); color: var(--muted); font-size: 0.875rem; }
@@ -185,8 +191,11 @@ select.input { appearance: auto; }
 .legend__swatch.cell { width: 24px; height: 20px; min-height: 0; padding: 0; border-radius: 5px; }
 .legend__swatch .icon { width: 12px; height: 12px; }
 
+/* position: relative makes the scroller the containing block of absolutely
+   positioned descendants (visually-hidden labels), so they scroll inside it
+   instead of widening the page. */
 .grid-scroll {
-  max-width: 100%; overflow-x: auto; background: var(--surface);
+  position: relative; max-width: 100%; overflow-x: auto; background: var(--surface);
   border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow);
 }
 .grid-hint { margin: 0 0 8px; font-size: 0.85rem; color: var(--muted); }
@@ -222,6 +231,7 @@ select.input { appearance: auto; }
 button.cell { cursor: pointer; }
 .cell--available { background: #fff; color: var(--accent-strong); border: 1.5px solid var(--accent); }
 .cell--available:hover { background: var(--accent-tint); }
+.cell--available[aria-disabled="true"] { cursor: progress; }
 .cell--selected, .cell--selected:hover { background: var(--accent); border-color: var(--accent); color: #fff; }
 .cell--unavailable { background: var(--stone); color: var(--muted); border: 1.5px dashed var(--line-strong); font-weight: 500; }
 .cell--mine { background: var(--success-tint); color: var(--success); border: 1.5px solid var(--success); }
