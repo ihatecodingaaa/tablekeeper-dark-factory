@@ -9,10 +9,12 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY tablekeeper ./tablekeeper
+COPY vercel_seed.py ./vercel_seed.py
+COPY vercel_bootstrap.py ./vercel_bootstrap.py
 
 RUN useradd --system --uid 10001 --no-create-home tablekeeper \
     && chown -R tablekeeper:tablekeeper /app
 
 USER tablekeeper
 
-CMD ["python", "-m", "tablekeeper.vercel_main"]
+CMD ["sh", "-c", "PORT=${PORT:-3000}; export PORT; python -m tablekeeper.vercel_main & pid=$!; python vercel_bootstrap.py; code=$?; if [ $code -ne 0 ]; then kill $pid 2>/dev/null || true; exit $code; fi; wait $pid"]
