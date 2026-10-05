@@ -28,7 +28,7 @@ def fresh_import(document, clock=None):
 def test_export_shape(world):
     out = world.svc.export_state()
     assert out["track"] == "tablekeeper" and out["format_version"] == 1
-    assert isinstance(out["state"], dict) and out["state"]["schema"] == 1
+    assert isinstance(out["state"], dict) and out["state"]["schema"] == 2
     json.dumps(out)
 
 

@@ -16,7 +16,8 @@ import secrets
 from . import passwords, timeutil
 from .errors import malformed, validation
 
-SCHEMA = 1
+SCHEMA = 2                 # stage 2; schema 1 (stage-1 exports) is upgraded on import
+SCHEMAS = (1, 2)
 MAX_ID = 64
 MAX_KEY = 255
 REFERENCE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -24,9 +25,25 @@ REFERENCE_LENGTH = 8
 STATUSES = ("confirmed", "cancelled")
 IDEMPOTENT_PATHS = ("/reservations", "/reservation-moves")
 _REFERENCE_RE = re.compile(r"[A-Z0-9]{6,12}")
-RESERVATION_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_id",
-                      "party_size", "status", "starts_at_local", "starts_at",
-                      "ends_at", "created_at")
+STAGE1_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_id",
+                 "party_size", "status", "starts_at_local", "starts_at",
+                 "ends_at", "created_at")
+STAGE2_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_ids",
+                 "party_size", "status", "starts_at_local", "starts_at",
+                 "ends_at", "created_at")
+
+
+def table_fields(table_ids) -> dict:
+    """Response table fields: table_ids always, table_id only for a single table."""
+    out = {"table_ids": list(table_ids)}
+    if len(table_ids) == 1:
+        out["table_id"] = table_ids[0]
+    return out
+
+
+def set_tables(public: dict, table_ids) -> None:
+    public.pop("table_id", None)
+    public.update(table_fields(table_ids))
 
 
 class InvalidState(Exception):
@@ -132,6 +149,24 @@ class Restaurant:
             self.tables.append(public)
             self.table_index[table_id] = public
 
+        combinable = raw.get("combinable", [])
+        combinable = [] if combinable is None else combinable
+        _require(isinstance(combinable, list), "combinable must be a list of table-id pairs")
+        self.combinable: list[list[str]] = []
+        self.pairs: dict[frozenset, tuple[str, str]] = {}
+        for entry in combinable:
+            _require(isinstance(entry, list) and len(entry) == 2,
+                     "each combinable entry must be a pair of table ids")
+            first, second = entry
+            _require(first in self.table_index and second in self.table_index
+                     if isinstance(first, str) and isinstance(second, str) else False,
+                     "combinable tables must be tables of this restaurant")
+            _require(first != second, "a combinable pair needs two distinct tables")
+            key = frozenset((first, second))
+            _require(key not in self.pairs, "duplicate combinable pair")
+            self.pairs[key] = (first, second)
+            self.combinable.append([first, second])
+
     def summary(self) -> dict:
         return {"id": self.id, "name": self.name, "timezone": self.timezone}
 
@@ -145,7 +180,24 @@ class Restaurant:
             "cancellation_cutoff_minutes": self.cutoff_minutes,
             "opening_hours": copy.deepcopy(self.opening_hours),
             "tables": copy.deepcopy(self.tables),
+            "combinable": copy.deepcopy(self.combinable),
         }
+
+    def canonical_tables(self, table_ids) -> list[str] | None:
+        """The stored order of a set of this restaurant's tables.
+
+        A single stays [id]; a pair takes its declared combinable order; an
+        undeclared pair (or anything larger) is None.
+        """
+        if len(table_ids) == 1:
+            return [table_ids[0]]
+        if len(table_ids) == 2:
+            pair = self.pairs.get(frozenset(table_ids))
+            return list(pair) if pair else None
+        return None
+
+    def capacity_of(self, table_ids) -> int:
+        return sum(self.table_index[t]["capacity"] for t in table_ids)
 
     def windows_on(self, day: dt.date) -> list[tuple[int, int]]:
         return self.windows.get(timeutil.weekday_of(day), [])
@@ -189,8 +241,8 @@ class Reservation:
         return self.public["restaurant_id"]
 
     @property
-    def table_id(self) -> str:
-        return self.public["table_id"]
+    def table_ids(self) -> tuple[str, ...]:
+        return tuple(self.public["table_ids"])
 
     @property
     def confirmed(self) -> bool:
@@ -292,6 +344,20 @@ def _resolve_times(restaurant: Restaurant, starts_at_local):
     return start, end
 
 
+def _seed_tables(restaurant: Restaurant, raw: dict) -> list[str]:
+    """table_id or table_ids (not both) naming one table or a declared pair."""
+    _require(("table_id" in raw) != ("table_ids" in raw),
+             "a seeded reservation holds exactly one of table_id or table_ids")
+    ids = [raw["table_id"]] if "table_id" in raw else raw["table_ids"]
+    _require(isinstance(ids, list) and 1 <= len(ids) <= 2 and all(valid_id(t) for t in ids)
+             and len(set(ids)) == len(ids), "seeded table_ids must be one or two distinct ids")
+    _require(all(t in restaurant.table_index for t in ids),
+             "seeded reservation names an unknown table of that restaurant")
+    canonical = restaurant.canonical_tables(ids)
+    _require(canonical is not None, "a seeded pair must be a declared combinable pair")
+    return canonical
+
+
 def prepare_fixture(fixture):
     """Validate a reset fixture and return (users_without_hashes, passwords).
 
@@ -343,12 +409,13 @@ def build_from_fixture(fixture: dict, users: list[dict], hashes: list[str],
             # Seeds carry the POST /reservations fields plus id, reference and
             # user_id; each stated format is enforced. Booking rules (grid, hours,
             # capacity, overlap) are deliberately not applied to seeds.
-            restaurant_id, table_id = raw.get("restaurant_id"), raw.get("table_id")
+            restaurant_id = raw.get("restaurant_id")
             _require(valid_id(restaurant_id) and restaurant_id in state.restaurants,
                      "seeded reservation names an unknown restaurant")
             restaurant = state.restaurants[restaurant_id]
-            _require(valid_id(table_id) and table_id in restaurant.table_index,
-                     "seeded reservation names an unknown table of that restaurant")
+            table_ids = _seed_tables(restaurant, raw)
+            status = raw.get("status") if "status" in raw else "confirmed"
+            _require(status in STATUSES, "seeded status must be confirmed or cancelled")
             party_size = raw.get("party_size")
             _require(is_int(party_size) and party_size >= 1, "party_size must be an integer >= 1")
             start, end = _resolve_times(restaurant, raw.get("starts_at_local"))
@@ -371,9 +438,9 @@ def build_from_fixture(fixture: dict, users: list[dict], hashes: list[str],
                 "reservation_id": rid,
                 "reference": reference,
                 "restaurant_id": restaurant.id,
-                "table_id": table_id,
+                **table_fields(table_ids),
                 "party_size": party_size,
-                "status": "confirmed",
+                "status": status,
                 "starts_at_local": raw["starts_at_local"],
                 "starts_at": timeutil.to_rfc3339(start, restaurant.zone),
                 "ends_at": timeutil.to_rfc3339(end, restaurant.zone),
@@ -397,8 +464,8 @@ def build_from_export(document) -> State:
         _require(is_int(version) and version == 1, "format_version must be 1")
         raw = document.get("state")
         _require(isinstance(raw, dict), "state must be an object")
-        _require(is_int(raw.get("schema")) and raw.get("schema") == SCHEMA,
-                 "unsupported state schema")
+        schema = raw.get("schema")
+        _require(is_int(schema) and schema in SCHEMAS, "unsupported state schema")
         state = State()
         seq = raw.get("seq", 0)
         _require(is_int(seq) and seq >= 0, "seq must be a non-negative integer")
@@ -435,8 +502,9 @@ def build_from_export(document) -> State:
         _require(isinstance(reservations, list), "reservations must be a list")
         for entry in reservations:
             _require(isinstance(entry, dict), "reservation must be an object")
+            fields = STAGE1_FIELDS if schema == 1 else STAGE2_FIELDS
             public = {}
-            for field in RESERVATION_FIELDS:
+            for field in fields:
                 _require(field in entry, f"reservation is missing {field}")
                 public[field] = entry[field]
             _require(valid_id(public["reservation_id"])
@@ -447,8 +515,24 @@ def build_from_export(document) -> State:
                      "reference invalid or duplicate")
             restaurant = state.restaurants.get(public["restaurant_id"])
             _require(restaurant is not None, "reservation names an unknown restaurant")
-            _require(public["table_id"] in restaurant.table_index,
+            if schema == 1:
+                # Upgrade: a stage-1 booking is the set of its one table.
+                ids = [public.pop("table_id")]
+                _require(valid_id(ids[0]), "reservation table_id invalid")
+            else:
+                ids = public.pop("table_ids")
+                _require(isinstance(ids, list) and all(valid_id(t) for t in ids),
+                         "reservation table_ids invalid")
+                if len(ids) == 1:
+                    _require(entry.get("table_id") == ids[0],
+                             "a single-table reservation carries a matching table_id")
+                else:
+                    _require("table_id" not in entry, "a combined reservation has no table_id")
+            _require(all(t in restaurant.table_index for t in ids),
                      "reservation names an unknown table")
+            _require(restaurant.canonical_tables(ids) == ids,
+                     "reservation tables must be one table or a declared pair in order")
+            set_tables(public, ids)
             _require(is_int(public["party_size"]) and public["party_size"] >= 1,
                      "party_size must be >= 1")
             _require(public["status"] in STATUSES, "status must be confirmed or cancelled")

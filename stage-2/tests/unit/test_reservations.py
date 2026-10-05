@@ -7,7 +7,7 @@ import pytest
 from tk_unit import (DATE, NOW, UTC, Clock, all_week, api_error, assert_error, body, fixture,
                      make_world, restaurant)
 
-RESERVATION_KEYS = {"reservation_id", "reference", "restaurant_id", "table_id", "party_size",
+RESERVATION_KEYS = {"reservation_id", "reference", "restaurant_id", "table_id", "table_ids", "party_size",
                     "status", "starts_at_local", "starts_at", "ends_at", "created_at"}
 
 
