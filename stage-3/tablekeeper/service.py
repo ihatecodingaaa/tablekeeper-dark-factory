@@ -9,6 +9,10 @@ is absent.
 Concurrency: one process-wide lock guards all state. Every read and write,
 including the idempotency check-and-store, runs inside it. Password hashing
 runs outside it.
+
+Stage 3: every availability and booking decision uses the policy selected for
+the local date (policy 0 is the fixture's own rules); bookings carry the terms
+they accepted, a revision and a history.
 """
 from __future__ import annotations
 
@@ -18,7 +22,7 @@ import re
 import secrets
 import threading
 
-from . import passwords, store, timeutil
+from . import passwords, series, store, timeutil
 from .errors import ApiError, malformed, not_found, unauthenticated, validation
 
 _EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+")
@@ -30,18 +34,22 @@ def _utc_now() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
-class _Booking:
-    """Validated booking fields: restaurant, table set, local start and party size."""
+class Planned:
+    """A validated booking: restaurant, canonical tables, local start, party,
+    the policy selected for its local date, and its absolute [start, end)."""
 
-    __slots__ = ("restaurant", "table_ids", "naive", "party_size", "start", "end")
+    __slots__ = ("restaurant", "user_id", "table_ids", "naive", "party_size", "policy",
+                 "start", "end")
 
-    def __init__(self, restaurant, table_ids, naive, party_size):
+    def __init__(self, restaurant, user_id, table_ids, naive, party_size, policy, start, end):
         self.restaurant = restaurant
+        self.user_id = user_id
         self.table_ids = list(table_ids)
         self.naive = naive
         self.party_size = party_size
-        self.start = None
-        self.end = None
+        self.policy = policy
+        self.start = start
+        self.end = end
 
 
 class Service:
@@ -75,7 +83,7 @@ class Service:
         return {"track": "tablekeeper", "format_version": 1, "state": state}
 
     def import_state(self, document) -> None:
-        """Atomically replace all state with an export document (R9)."""
+        """Atomically replace all state with a stage-1/2/3 export document (R9, S3-R11)."""
         try:
             snapshot = copy.deepcopy(document)
         except RecursionError:
@@ -160,7 +168,14 @@ class Service:
                 raise unauthenticated("unknown bearer token")
             return user_id
 
-    # -- restaurants -----------------------------------------------------------
+    def try_authenticate(self, authorization: str | None) -> str | None:
+        """The user_id for a valid bearer token, else None. Never raises."""
+        try:
+            return self.authenticate(authorization)
+        except ApiError:
+            return None
+
+    # -- restaurants and policies ----------------------------------------------
 
     def list_restaurants(self) -> dict:
         with self._lock:
@@ -172,6 +187,43 @@ class Service:
             if restaurant is None:
                 raise not_found("no such restaurant")
             return restaurant.detail()
+
+    def publish_policy(self, user_id, restaurant_id, idempotency_key,
+                       body: dict) -> tuple[int, dict]:
+        """S3-R2: 404, 403, key, replay/409, 422 policy fields, then 201."""
+        with self._lock:
+            state = self._state
+            restaurant = state.restaurants.get(restaurant_id)
+            if restaurant is None:
+                raise not_found("no such restaurant")
+            if user_id not in restaurant.managers:
+                raise ApiError(403, "forbidden", "only the restaurant's managers may publish")
+            key = self._check_key(idempotency_key)
+            canonical = store.canonical_json(body)
+            scope = (user_id, "POST", f"/restaurants/{restaurant_id}/policies", key)
+            replay = self._replay(state, scope, canonical)
+            if replay is not None:
+                return replay
+            try:
+                policy = store.Policy.from_body(body, restaurant.table_order(),
+                                                len(restaurant.policies) + 1)
+            except store.InvalidState as exc:
+                raise validation(str(exc)) from None
+            restaurant.policies.append(policy)
+            self._bump_restaurant_revision(state, restaurant.id)
+            response = policy.public()
+            self._remember(state, scope, canonical, 201, response)
+            return 201, response
+
+    def list_policies(self, restaurant_id) -> dict:
+        """Published policies in publication order (policy 0 omitted)."""
+        with self._lock:
+            restaurant = self._state.restaurants.get(restaurant_id)
+            if restaurant is None:
+                raise not_found("no such restaurant")
+            return {"policies": [p.public() for p in restaurant.policies]}
+
+    # -- availability ------------------------------------------------------------
 
     def availability(self, query: dict[str, list[str]]) -> dict:
         """query = parse_qs(keep_blank_values=True); the first value is used."""
@@ -192,54 +244,72 @@ class Service:
         if party_size is None:
             raise validation("party_size must be a positive integer")
         self._check_id("restaurant_id", restaurant_id)
+        explain = "explain" in query
+        if explain:
+            values = query.get("explain") or [""]
+            if values[0] != "true":
+                raise validation("explain accepts only the value true")
         with self._lock:
             state = self._state
             restaurant = state.restaurants.get(restaurant_id)
             if restaurant is None:
                 raise not_found("no such restaurant")
+            policy = restaurant.policy_for(day)
             busy = self._occupancy(state, restaurant.id)
             slots = []
             seen = set()
-            for start, naive in self._slot_starts(restaurant, day):
+            for start, naive in self._slot_starts(restaurant, day, policy):
                 local_text = timeutil.format_local(naive)
                 if local_text in seen:
                     continue
                 seen.add(local_text)
-                end = restaurant.end_of(start)
+                end = policy.end_of(start)
                 free = {t["id"] for t in restaurant.tables
                         if not any(s < end and start < e for s, e in busy.get(t["id"], ()))}
                 singles = [t["id"] for t in restaurant.tables
-                           if t["id"] in free and t["capacity"] >= party_size]
-                options = [{"table_ids": [t], "capacity": restaurant.table_index[t]["capacity"]}
-                           for t in singles]
+                           if t["id"] in free and policy.capacities[t["id"]] >= party_size]
+                options = [{"table_ids": [t], "capacity": policy.capacities[t]} for t in singles]
                 for pair in restaurant.combinable:
-                    capacity = restaurant.capacity_of(pair)
+                    capacity = policy.capacity_of(pair)
                     if pair[0] in free and pair[1] in free and capacity >= party_size:
                         options.append({"table_ids": list(pair), "capacity": capacity})
-                slots.append((start, {"starts_at_local": local_text,
-                                      "starts_at": timeutil.to_rfc3339(start, restaurant.zone),
-                                      "available_table_ids": singles,
-                                      "available_options": options}))
+                slot = {"starts_at_local": local_text,
+                        "starts_at": timeutil.to_rfc3339(start, restaurant.zone),
+                        "available_table_ids": singles,
+                        "available_options": options}
+                if explain:
+                    slot["explain"] = [self._explain(t["id"], policy, party_size, t["id"] in free)
+                                       for t in restaurant.tables]
+                slots.append((start, slot))
         slots.sort(key=lambda item: item[0])
         return {"restaurant_id": restaurant.id, "date": day.isoformat(),
                 "timezone": restaurant.timezone, "slots": [s for _, s in slots]}
 
     @staticmethod
-    def _slot_starts(restaurant, day: dt.date):
-        """(instant, naive) of every bookable slot start on a local date (R7)."""
-        for opens, closes in restaurant.windows_on(day):
+    def _explain(table_id, policy, party_size, free) -> dict:
+        capacity = party_size <= policy.capacities[table_id]
+        return {"table_id": table_id, "policy_version": policy.version,
+                "available": capacity and free,
+                "rules": [{"rule": "capacity", "holds": capacity},
+                          {"rule": "no_overlap", "holds": free}]}
+
+    @staticmethod
+    def _slot_starts(restaurant, day: dt.date, policy):
+        """(instant, naive) of every bookable slot start on a local date (R7, S3-R1)."""
+        for opens, closes in policy.windows_on(day):
             closes_at = timeutil.local_minutes_instant(day, closes, restaurant.zone)
             minute = opens
             while minute < closes and minute < 24 * 60:
                 naive = dt.datetime.combine(day, dt.time(minute // 60, minute % 60))
                 start = timeutil.resolve_local(naive, restaurant.zone)
-                end = restaurant.end_of(start) if start is not None else None
+                end = policy.end_of(start) if start is not None else None
                 if end is not None and end <= closes_at:
                     yield start, naive
-                minute += restaurant.slot_minutes
+                minute += policy.slot_minutes
 
     @staticmethod
     def _occupancy(state, restaurant_id, exclude=()) -> dict[str, list]:
+        """Confirmed bookings' own stored [start, end) per table."""
         busy: dict[str, list] = {}
         for reservation in state.reservations.values():
             if (reservation.confirmed and reservation.restaurant_id == restaurant_id
@@ -249,11 +319,14 @@ class Service:
         return busy
 
     @staticmethod
-    def _conflicts(busy, table_ids, start, end) -> bool:
-        """True when any member table has an overlapping confirmed booking."""
-        return any(s < end and start < e for t in table_ids for s, e in busy.get(t, ()))
+    def _conflicts(busy, table_ids, start, end, extra=()) -> bool:
+        """True when any member table overlaps a confirmed booking or an `extra`
+        (table_id, start, end) interval planned earlier in the same operation."""
+        if any(s < end and start < e for t in table_ids for s, e in busy.get(t, ())):
+            return True
+        return any(t in table_ids and s < end and start < e for t, s, e in extra)
 
-    # -- booking validation (R2) -------------------------------------------------
+    # -- booking validation (R2, S2-R2, S3-R1) -------------------------------------
 
     @staticmethod
     def _check_types(body: dict, fields) -> None:
@@ -317,39 +390,50 @@ class Service:
         return naive
 
     @staticmethod
-    def _check_rules(booking: _Booking) -> None:
-        """S2-R2 steps 4-6 for parsed booking fields; canonicalises tables, sets start/end."""
-        restaurant = booking.restaurant
-        for table_id in booking.table_ids:
+    def _check_rules(restaurant, table_ids, naive, party_size, user_id=None) -> Planned:
+        """S2-R2 steps 4-6 under the policy of the local start date (S3-R1)."""
+        for table_id in table_ids:
             if table_id not in restaurant.table_index:
                 raise not_found("no such table at this restaurant")
-        canonical = restaurant.canonical_tables(booking.table_ids)
+        canonical = restaurant.canonical_tables(table_ids)
         if canonical is None:
             raise ApiError(422, "combination_not_allowed", "those tables cannot be combined")
-        booking.table_ids = canonical
-        start = timeutil.resolve_local(booking.naive, restaurant.zone)
+        start = timeutil.resolve_local(naive, restaurant.zone)
         if start is None:
             raise ApiError(422, "invalid_local_time", "that local time does not exist")
-        end = restaurant.end_of(start)
-        day = booking.naive.date()
-        minute = booking.naive.hour * 60 + booking.naive.minute
+        day = naive.date()
+        policy = restaurant.policy_for(day)
+        end = policy.end_of(start)
+        minute = naive.hour * 60 + naive.minute
         fitting = [
-            (opens, closes) for opens, closes in restaurant.windows_on(day)
+            (opens, closes) for opens, closes in policy.windows_on(day)
             if opens <= minute < closes and end is not None
             and end <= timeutil.local_minutes_instant(day, closes, restaurant.zone)
         ]
         if not fitting:
             raise ApiError(422, "outside_opening_hours", "outside opening hours")
-        if not any((minute - opens) % restaurant.slot_minutes == 0 for opens, _ in fitting):
+        if not any((minute - opens) % policy.slot_minutes == 0 for opens, _ in fitting):
             raise ApiError(422, "not_on_slot_grid", "start is not on the slot grid")
-        if booking.party_size > restaurant.capacity_of(canonical):
+        if party_size > policy.capacity_of(canonical):
             raise ApiError(422, "party_exceeds_capacity", "party exceeds table capacity")
-        booking.start, booking.end = start, end
+        return Planned(restaurant, user_id, canonical, naive, party_size, policy, start, end)
 
     def _check_cutoff(self, restaurant, reservation) -> None:
-        """R3: allowed only while now < starts_at - cutoff (current start)."""
-        if restaurant.cutoff_passed(reservation.start, self._now()):
+        """R3 against the reservation's ACCEPTED cutoff and its current start."""
+        minutes = reservation.terms["cancellation_cutoff_minutes"]
+        if store.cutoff_passed(reservation.start, self._now(), minutes):
             raise ApiError(409, "cutoff_passed", "the cancellation cutoff has passed")
+
+    @staticmethod
+    def _check_expected_revision(body: dict, reservation) -> None:
+        """S3-R4 steps 4-5: optional expected_revision, 422 if invalid, 409 if stale."""
+        if "expected_revision" not in body:
+            return
+        value = body["expected_revision"]
+        if not store.is_int(value) or value < 1:
+            raise validation("expected_revision must be a positive integer")
+        if value != reservation.revision:
+            raise ApiError(409, "stale_revision", "the reservation has a newer revision")
 
     # -- idempotency (R1) ---------------------------------------------------------
 
@@ -375,6 +459,67 @@ class Service:
     def _remember(state, scope, canonical, status, response) -> None:
         state.idempotency[scope] = {"body": canonical, "status": status,
                                     "response": copy.deepcopy(response)}
+
+    # -- core hooks (S3-CONTRACT C2), called inside the lock ------------------------
+
+    def _plan_new_booking(self, state, user_id, restaurant, naive_local_dt, table_ids,
+                          party_size, extra_busy=()) -> Planned:
+        """Validate a brand-new booking on its local date's policy; mutates nothing.
+
+        Order: invalid_local_time, outside_opening_hours, not_on_slot_grid,
+        party_exceeds_capacity, then table_unavailable against confirmed bookings
+        and `extra_busy` (table_id, start, end) intervals planned earlier.
+        """
+        planned = self._check_rules(restaurant, list(table_ids), naive_local_dt, party_size,
+                                    user_id)
+        busy = self._occupancy(state, restaurant.id)
+        if self._conflicts(busy, planned.table_ids, planned.start, planned.end, extra_busy):
+            raise ApiError(409, "table_unavailable", "table is taken at that time")
+        return planned
+
+    def _insert_new_booking(self, state, planned: Planned) -> store.Reservation:
+        """Create the reservation at revision 1 with a created history entry.
+        Does not bump the restaurant revision."""
+        restaurant = planned.restaurant
+        public = {
+            "reservation_id": state.new_reservation_id(),
+            "reference": state.new_reference(),
+            "restaurant_id": restaurant.id,
+            **store.table_fields(planned.table_ids),
+            "party_size": planned.party_size,
+            "status": "confirmed",
+            "starts_at_local": timeutil.format_local(planned.naive),
+            "starts_at": timeutil.to_rfc3339(planned.start, restaurant.zone),
+            "ends_at": timeutil.to_rfc3339(planned.end, restaurant.zone),
+            "created_at": timeutil.utc_rfc3339(self._now()),
+            "revision": 1,
+            "accepted_terms": planned.policy.terms(),
+        }
+        reservation = store.Reservation(public, planned.user_id, planned.start, planned.end,
+                                        state.next_seq())
+        reservation.history.append(store.history_entry(
+            1, public["created_at"], "created", store.created_changes(public), reservation))
+        state.add_reservation(reservation)
+        return reservation
+
+    @staticmethod
+    def _bump_restaurant_revision(state, restaurant_id) -> None:
+        state.restaurant_revisions[restaurant_id] = (
+            state.restaurant_revisions.get(restaurant_id, 0) + 1)
+
+    @staticmethod
+    def _reservation_view(reservation) -> dict:
+        return reservation.view()
+
+    def _history_at(self, reservation) -> str:
+        """Now (RFC 3339, UTC), never earlier than the reservation's last entry."""
+        now = self._now()
+        if reservation.history:
+            last = reservation.history[-1]["at"]
+            last_at = timeutil.parse_rfc3339(last)
+            if last_at is not None and now < last_at:
+                return last
+        return timeutil.utc_rfc3339(now)
 
     # -- reservations ---------------------------------------------------------------
 
@@ -402,26 +547,9 @@ class Service:
             restaurant = state.restaurants.get(body["restaurant_id"])
             if restaurant is None:
                 raise not_found("no such restaurant")
-            booking = _Booking(restaurant, ids, naive, party_size)
-            self._check_rules(booking)
-            busy = self._occupancy(state, restaurant.id)
-            if self._conflicts(busy, booking.table_ids, booking.start, booking.end):
-                raise ApiError(409, "table_unavailable", "table is taken at that time")
-            public = {
-                "reservation_id": state.new_reservation_id(),
-                "reference": state.new_reference(),
-                "restaurant_id": restaurant.id,
-                **store.table_fields(booking.table_ids),
-                "party_size": party_size,
-                "status": "confirmed",
-                "starts_at_local": timeutil.format_local(naive),
-                "starts_at": timeutil.to_rfc3339(booking.start, restaurant.zone),
-                "ends_at": timeutil.to_rfc3339(booking.end, restaurant.zone),
-                "created_at": timeutil.utc_rfc3339(self._now()),
-            }
-            reservation = store.Reservation(public, user_id, booking.start, booking.end,
-                                            state.next_seq())
-            state.add_reservation(reservation)
+            planned = self._plan_new_booking(state, user_id, restaurant, naive, ids, party_size)
+            reservation = self._insert_new_booking(state, planned)
+            self._bump_restaurant_revision(state, restaurant.id)
             response = reservation.view()
             self._remember(state, scope, canonical, 201, response)
             return 201, response
@@ -434,7 +562,7 @@ class Service:
 
     def _own(self, state, user_id, reference) -> store.Reservation:
         reservation = state.reservation_by_reference(reference)
-        if reservation is None or reservation.user_id != user_id:
+        if reservation is None or user_id is None or reservation.user_id != user_id:
             raise not_found("no such reservation")
         return reservation
 
@@ -442,26 +570,50 @@ class Service:
         with self._lock:
             return self._own(self._state, user_id, reference).view()
 
+    def reservation_history(self, user_id, reference) -> dict:
+        """S3-R6: owner only; None (no/unknown token) and anyone else get 404."""
+        with self._lock:
+            reservation = self._own(self._state, user_id, reference)
+            return {"reference": reservation.reference,
+                    "entries": copy.deepcopy(reservation.history)}
+
+    def reservation_decision(self, user_id, reference) -> dict:
+        """S3-R6: the current booking's revision and accepted terms, owner only."""
+        with self._lock:
+            reservation = self._own(self._state, user_id, reference)
+            return {"reference": reservation.reference, "revision": reservation.revision,
+                    "accepted_terms": copy.deepcopy(reservation.terms)}
+
     def cancel_reservation(self, user_id, reference) -> dict:
-        """R5: 404, then already-cancelled 200, then cutoff 409."""
+        """S3-R5: 404, already-cancelled 200 unchanged, accepted cutoff 409, cancel."""
         with self._lock:
             state = self._state
             reservation = self._own(state, user_id, reference)
             if not reservation.confirmed:
                 return reservation.view()
             self._check_cutoff(state.restaurants[reservation.restaurant_id], reservation)
+            at = self._history_at(reservation)
             reservation.public["status"] = "cancelled"
+            reservation.public["revision"] += 1
+            reservation.history.append(store.history_entry(
+                len(reservation.history) + 1, at, "cancelled", [], reservation))
+            self._bump_restaurant_revision(state, reservation.restaurant_id)
+            series.on_cancelled(state, reservation)
             return reservation.view()
 
-    def _resolve_change(self, state, reservation, change: dict):
-        """Validate a PATCH-style change for one reservation (R4 after 404).
+    def _resolve_change(self, state, reservation, change: dict, item: dict | None = None):
+        """Validate a PATCH-style change for one reservation (after 404).
 
-        Returns None for a no-op, else a _Booking with start/end set. Occupancy
-        is checked by the caller.
+        PATCH checks expected_revision before calling (S3-R4); a moves item
+        passes `item` so it is checked after the cancelled check (S3-R10).
+        Returns None for a no-op, else a Planned under the resulting date's
+        policy. Occupancy is checked by the caller.
         """
         restaurant = state.restaurants[reservation.restaurant_id]
         if not reservation.confirmed:
             raise ApiError(409, "reservation_cancelled", "reservation is cancelled")
+        if item is not None:
+            self._check_expected_revision(item, reservation)
         self._check_cutoff(restaurant, reservation)
         self._check_types(change, ("starts_at_local",))
         self._check_table_types(change)
@@ -477,40 +629,67 @@ class Service:
         if (set(ids) == set(reservation.table_ids) and party_size == current["party_size"]
                 and timeutil.format_local(naive) == current["starts_at_local"]):
             return None
-        booking = _Booking(restaurant, ids, naive, party_size)
-        self._check_rules(booking)
-        return booking
+        return self._check_rules(restaurant, ids, naive, party_size, reservation.user_id)
 
     @staticmethod
-    def _apply(reservation, booking: _Booking) -> None:
-        zone = booking.restaurant.zone
-        store.set_tables(reservation.public, booking.table_ids)
+    def _changes(reservation, planned: Planned) -> list:
+        """History changes in the order table_id/table_ids, starts_at_local, party_size."""
+        before, after = list(reservation.table_ids), list(planned.table_ids)
+        changes = []
+        if set(before) != set(after):
+            if len(before) == 1 and len(after) == 1:
+                changes.append({"field": "table_id", "from": before[0], "to": after[0]})
+            else:
+                changes.append({"field": "table_ids", "from": before, "to": after})
+        new_local = timeutil.format_local(planned.naive)
+        if new_local != reservation.public["starts_at_local"]:
+            changes.append({"field": "starts_at_local",
+                            "from": reservation.public["starts_at_local"], "to": new_local})
+        if planned.party_size != reservation.public["party_size"]:
+            changes.append({"field": "party_size", "from": reservation.public["party_size"],
+                            "to": planned.party_size})
+        return changes
+
+    def _apply(self, reservation, planned: Planned) -> None:
+        """A real change: new fields, terms and end; revision +1; a changed entry."""
+        changes = self._changes(reservation, planned)
+        at = self._history_at(reservation)
+        zone = planned.restaurant.zone
+        store.set_tables(reservation.public, planned.table_ids)
         reservation.public.update({
-            "party_size": booking.party_size,
-            "starts_at_local": timeutil.format_local(booking.naive),
-            "starts_at": timeutil.to_rfc3339(booking.start, zone),
-            "ends_at": timeutil.to_rfc3339(booking.end, zone),
+            "party_size": planned.party_size,
+            "starts_at_local": timeutil.format_local(planned.naive),
+            "starts_at": timeutil.to_rfc3339(planned.start, zone),
+            "ends_at": timeutil.to_rfc3339(planned.end, zone),
+            "revision": reservation.revision + 1,
+            "accepted_terms": planned.policy.terms(),
         })
-        reservation.start, reservation.end = booking.start, booking.end
+        reservation.start, reservation.end = planned.start, planned.end
+        reservation.history.append(store.history_entry(
+            len(reservation.history) + 1, at, "changed", changes, reservation))
 
     def amend_reservation(self, user_id, reference, body: dict) -> dict:
-        """R4: 400 types, 404, 409 cancelled, 409 cutoff, R2 2-8; {} is a no-op."""
+        """S3-R4: 400 types, 404, 422/409 expected_revision, 409 cancelled,
+        409 cutoff (old terms), then validation under the resulting date's policy."""
         self._check_types(body, ("starts_at_local",))
         self._check_table_types(body)
         change = {field: body[field] for field in _PATCH_FIELDS if field in body}
         with self._lock:
             state = self._state
             reservation = self._own(state, user_id, reference)
-            booking = self._resolve_change(state, reservation, change)
-            if booking is None:
+            self._check_expected_revision(body, reservation)
+            planned = self._resolve_change(state, reservation, change)
+            if planned is None:
                 return reservation.view()
             busy = self._occupancy(state, reservation.restaurant_id, exclude={reservation.id})
-            if self._conflicts(busy, booking.table_ids, booking.start, booking.end):
+            if self._conflicts(busy, planned.table_ids, planned.start, planned.end):
                 raise ApiError(409, "table_unavailable", "table is taken at that time")
-            self._apply(reservation, booking)
+            self._apply(reservation, planned)
+            self._bump_restaurant_revision(state, reservation.restaurant_id)
+            series.on_amended(state, reservation)
             return reservation.view()
 
-    # -- moves (R8) ---------------------------------------------------------------------
+    # -- moves (R8, S3-R10) ---------------------------------------------------------------
 
     @staticmethod
     def _move_items(body: dict) -> list[dict]:
@@ -541,15 +720,15 @@ class Service:
             reservations = [self._own(state, user_id, item["reference"]) for item in items]
             if len({r.restaurant_id for r in reservations}) != 1:
                 raise validation("all moved bookings must belong to the same restaurant")
-            bookings, results = [], []
+            plans, results = [], []
             for item, reservation in zip(items, reservations):
                 change = {field: item[field] for field in _PATCH_FIELDS if field in item}
-                booking = self._resolve_change(state, reservation, change)
-                bookings.append(booking)
-                if booking is None:
+                planned = self._resolve_change(state, reservation, change, item=item)
+                plans.append(planned)
+                if planned is None:
                     results.append((reservation.table_ids, reservation.start, reservation.end))
                 else:
-                    results.append((booking.table_ids, booking.start, booking.end))
+                    results.append((planned.table_ids, planned.start, planned.end))
             listed = {r.id for r in reservations}
             busy = self._occupancy(state, reservations[0].restaurant_id, exclude=listed)
             for i, (table_ids, start, end) in enumerate(results):
@@ -559,9 +738,22 @@ class Service:
                     if (set(other_tables) & set(table_ids)
                             and other_start < end and start < other_end):
                         raise ApiError(409, "table_unavailable", "moved bookings overlap")
-            for reservation, booking in zip(reservations, bookings):
-                if booking is not None:
-                    self._apply(reservation, booking)
+            changed = []
+            for reservation, planned in zip(reservations, plans):
+                if planned is not None:
+                    self._apply(reservation, planned)
+                    changed.append(reservation)
+            if changed:
+                self._bump_restaurant_revision(state, reservations[0].restaurant_id)
+                series.on_moved(state, changed)
             response = {"reservations": [r.view() for r in reservations]}
             self._remember(state, scope, canonical, 201, response)
             return 201, response
+
+    # -- series (S3-CONTRACT C1: implemented by the PE in series.py) --------------------
+
+    def create_series(self, user_id, idempotency_key, body: dict) -> tuple[int, dict]:
+        return series.create_series(self, user_id, idempotency_key, body)
+
+    def get_series(self, user_id, series_id) -> dict:
+        return series.get_series(self, user_id, series_id)
