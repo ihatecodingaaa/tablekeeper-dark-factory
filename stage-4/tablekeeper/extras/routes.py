@@ -175,6 +175,16 @@ def settlement(ctx, rid):
         return 200, guarantee.settlement(get(state), state, rid)
 
 
+def me(ctx):
+    user = ctx.user()
+    with ctx.svc._lock:
+        state = ctx.svc._state
+        profile = state.users[user]
+        return 200, {"user_id": user, "display_name": profile["display_name"],
+                     "managed_restaurant_ids": [r.id for r in state.restaurants.values()
+                                                if user in r.managers]}
+
+
 def my_notifications(ctx):
     user = ctx.user()
     with ctx.svc._lock:
@@ -296,6 +306,7 @@ ROUTES = [
     (rf"/x/reservations/{_SEGMENT}/preferences", {"GET": booking_prefs, "PUT": booking_prefs}),
     (rf"/x/reservations/{_SEGMENT}/calendar\.ics", {"GET": calendar}),
     (rf"/x/evening/{_SEGMENT}", {"GET": evening}),
+    (r"/x/me", {"GET": me}),
     (r"/x/me/notifications", {"GET": my_notifications}),
     (r"/x/me/preferences", {"GET": my_prefs, "PUT": my_prefs}),
     (r"/x/me/passport", {"GET": passport}),
