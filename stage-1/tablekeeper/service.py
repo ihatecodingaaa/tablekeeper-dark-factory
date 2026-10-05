@@ -191,6 +191,7 @@ class Service:
         party_size = timeutil.parse_positive_digits(party_text)
         if party_size is None:
             raise validation("party_size must be a positive integer")
+        self._check_id("restaurant_id", restaurant_id)
         with self._lock:
             state = self._state
             restaurant = state.restaurants.get(restaurant_id)
@@ -247,6 +248,13 @@ class Service:
         for field in fields:
             if field in body and not isinstance(body[field], str):
                 raise malformed(f"{field} must be a string")
+
+    @staticmethod
+    def _check_id(field: str, value) -> str:
+        """Spec 3.4/5: IDs are 1..64 characters; anything else is 422."""
+        if not store.valid_id(value):
+            raise validation(f"{field} must be 1..64 characters")
+        return value
 
     @staticmethod
     def _parse_party_size(value) -> int:
@@ -334,6 +342,8 @@ class Service:
             for field in ("restaurant_id", "table_id", "starts_at_local", "party_size"):
                 if field not in body:
                     raise validation(f"{field} is required")
+            self._check_id("restaurant_id", body["restaurant_id"])
+            self._check_id("table_id", body["table_id"])
             party_size = self._parse_party_size(body["party_size"])
             naive = self._parse_starts_at_local(body["starts_at_local"])
             restaurant = state.restaurants.get(body["restaurant_id"])
@@ -407,7 +417,8 @@ class Service:
         naive = (self._parse_starts_at_local(change["starts_at_local"])
                  if "starts_at_local" in change
                  else timeutil.parse_local(current["starts_at_local"]))
-        table_id = change.get("table_id", current["table_id"])
+        table_id = (self._check_id("table_id", change["table_id"])
+                    if "table_id" in change else current["table_id"])
         if (table_id == current["table_id"] and party_size == current["party_size"]
                 and timeutil.format_local(naive) == current["starts_at_local"]):
             return None
@@ -453,8 +464,8 @@ class Service:
             raise validation("moves must be a list of 1..8 objects")
         references = set()
         for item in items:
-            if not isinstance(item, dict) or not isinstance(item.get("reference"), str):
-                raise validation("each move must be an object with a string reference")
+            if not isinstance(item, dict) or not store.valid_id(item.get("reference")):
+                raise validation("each move must be an object with a 1..64 character reference")
             if item["reference"] in references:
                 raise validation("duplicate reference in moves")
             references.add(item["reference"])

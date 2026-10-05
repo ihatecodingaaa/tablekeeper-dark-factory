@@ -190,3 +190,8 @@ def test_fall_back_slot_fit_uses_absolute_duration():
 def test_extreme_dates_are_422_not_5xx(world, date):
     query = {"restaurant_id": ["r_anker"], "date": [date], "party_size": ["2"]}
     assert_error(api_error(world.svc.availability, query), 422, "validation_failed")
+
+
+def test_restaurant_id_over_64_characters_is_422(world):
+    query = {"restaurant_id": ["r" * 65], "date": [DATE], "party_size": ["2"]}
+    assert_error(api_error(world.svc.availability, query), 422, "validation_failed")

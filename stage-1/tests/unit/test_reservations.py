@@ -420,3 +420,19 @@ def test_extreme_years_are_422_not_5xx(world, starts_at_local):
     err = api_error(world.svc.create_reservation, world.ada, world.key(),
                     body(starts_at_local=starts_at_local))
     assert_error(err, 422, "validation_failed")
+
+
+@pytest.mark.parametrize("field,value", [("restaurant_id", "r" * 65), ("table_id", "t" * 65),
+                                         ("restaurant_id", ""), ("table_id", "")])
+def test_ids_over_64_characters_or_empty_are_422(world, field, value):
+    # Spec 3.4: IDs are at most 64 characters; 5: exceeding a stated length is 422.
+    data = body()
+    data[field] = value
+    err = api_error(world.svc.create_reservation, world.ada, world.key(), data)
+    assert_error(err, 422, "validation_failed")
+
+
+def test_amend_table_id_over_64_characters_is_422(world):
+    out = world.booked()
+    err = api_error(world.svc.amend_reservation, world.ada, out["reference"], {"table_id": "t" * 65})
+    assert_error(err, 422, "validation_failed")

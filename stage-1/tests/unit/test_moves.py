@@ -215,3 +215,16 @@ def test_moves_idempotency(world):
     assert_error(err, 409, "idempotency_key_reuse")
     err = api_error(world.svc.move_reservations, world.ada, "m1", {"moves": "garbage"})
     assert_error(err, 409, "idempotency_key_reuse")
+
+
+@pytest.mark.parametrize("item", [{"reference": "R" * 65}, {"reference": ""}])
+def test_move_reference_over_64_or_empty_is_422(world, item):
+    assert_error(api_error(world.svc.move_reservations, world.ada, "m1", moves(item)),
+                 422, "validation_failed")
+
+
+def test_move_table_id_over_64_is_422(world):
+    a = world.booked()
+    err = api_error(world.svc.move_reservations, world.ada, "m1",
+                    moves({"reference": a["reference"], "table_id": "t" * 65}))
+    assert_error(err, 422, "validation_failed")
