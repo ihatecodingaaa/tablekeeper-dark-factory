@@ -38,6 +38,7 @@ Idle seats are put to work instead of waiting: cross-reviewing another seat's co
 - **Stage 2, developer cross-review of the UI:** a booking reply could be silently dropped if the diner clicked another table while the request was in flight, leaving a booking on the server that the screen never showed. It was fixed before acceptance.
 - **Stage 4, ruling review:** the spec says larger planning inputs "may" be refused. Refusing an input the optimizer could solve exactly only adds risk, so the planner always solves exactly within a deterministic work budget. The verifier changed its expectations openly to match the ruling.
 - **Stage 4, robustness pass:** credentialed notification delivery used one thread per message, so a hung mail host could pile up threads. A bounded worker pool replaced it.
+- **Final evidence, verifier secret scan:** the downloaded `room.json` contained one Jam receive lease, a seat credential mirrored from a pre-run diagnostic. The coordinator's own scan had missed that pattern. The verifier REJECTed the final HEAD, the value was replaced with `[REDACTED]` as the participant guide prescribes, and the scanner was extended. The value remains in one unpushed commit because history is never rewritten, so rotating that lease is recorded as a pre-push action for the owner.
 
 ## Evidence and gates
 
