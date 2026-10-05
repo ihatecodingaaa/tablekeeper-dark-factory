@@ -101,7 +101,7 @@
   function reveal(el) {
     if (!el) return;
     el.focus({ preventScroll: true });
-    el.scrollIntoView({ block: "nearest", behavior: prefersReducedMotion() ? "auto" : "smooth" });
+    el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: prefersReducedMotion() ? "auto" : "smooth" });
   }
 
   // ---------------------------------------------------------------- formatting
@@ -330,6 +330,7 @@
     var announcer = byId("search-announcer");
 
     var searchSeq = 0;    // only the newest search may draw the grid
+    var searching = false;  // the newest search has not answered yet
     var view = null;      // the search on screen: query, restaurant, slots
     var booking = null;   // the open booking form
     var mine = {};        // reservations confirmed on this page, by reference
@@ -369,6 +370,7 @@
       var problem = queryProblem(query);
       if (problem) {
         searchSeq += 1;
+        searching = false;
         view = null;
         showState("error", "Check your search", problem);
         return;
@@ -379,6 +381,7 @@
     function runSearch(query, refreshing) {
       searchSeq += 1;
       var seq = searchSeq;
+      searching = true;
       if (refreshing) showRefreshing();
       else renderLoading();
       var params = new URLSearchParams({
@@ -389,6 +392,7 @@
         api("GET", "/restaurants/" + encodeURIComponent(query.restaurantId))
       ]).then(function (answers) {
         if (seq !== searchSeq) return;  // a newer search owns the screen: drop this late answer
+        searching = false;
         var availability = answers[0];
         var restaurant = answers[1];
         if (!availability.ok || !restaurant.ok) {
@@ -409,6 +413,7 @@
           : "No bookable times on this day.");
       }, function () {
         if (seq !== searchSeq) return;
+        searching = false;
         if (refreshing && view) {
           renderGrid();
           results.insertBefore(notice("error", "alert", "Availability not updated",
@@ -489,6 +494,11 @@
       var restaurant = view.restaurant;
       var tables = restaurant.tables || [];
       results.setAttribute("aria-busy", "false");
+      // Redrawing the same search (a selection or a refresh) keeps the grid's
+      // sideways scroll, so a chosen cell on a narrow screen stays in view.
+      var gridKey = [restaurant.id, view.date, view.partySize].join("|");
+      var previous = results.querySelector(".grid-scroll");
+      var keepScroll = previous && previous.getAttribute("data-grid-key") === gridKey ? previous.scrollLeft : 0;
       var head = h("div", { "class": "results__head" },
         h("div", null, heading(restaurant.name),
           h("p", { "class": "results__meta" }, formatDate(view.date) + " \u00b7 " + guests(view.partySize) +
@@ -552,6 +562,8 @@
         anyFree ? null : notice("info", "info", "Fully booked for " + guests(view.partySize),
           "Every table is taken or too small at these times. Try another date or fewer guests."),
         hint, scroller);
+      scroller.setAttribute("data-grid-key", gridKey);
+      scroller.scrollLeft = keepScroll;
       if (scroller.scrollWidth > scroller.clientWidth + 1) hint.hidden = false;
     }
 
@@ -575,6 +587,7 @@
         "data-testid": "slot-" + ids.join("+") + "-" + time,
         "data-available": "true",
         "aria-pressed": selected ? "true" : "false",
+        "aria-disabled": booking && booking.busy ? "true" : null,
         "aria-label": label + " at " + time + (pair ? ", seats " + seats(restaurant, ids) : "") + ", free",
         onclick: function () { selectSlot(slot, ids); }
       }, icon(selected ? "check" : "plus"), content);
@@ -609,6 +622,9 @@
     // ------------------------------------------------------------ booking form
 
     function selectSlot(slot, ids) {
+      // While a booking request is on its way, its form stays put: switching
+      // tables now would hide the outcome of a request that may have committed.
+      if (booking && booking.busy) return;
       if (!session.get()) {
         showAuthError();
         return;
@@ -678,6 +694,9 @@
       setChildren(panel, form, confirmation);
       workspace.classList.add("workspace--booking");
       renderGrid();
+      // Keep the chosen cell visible inside the grid's own sideways scroller.
+      var chosen = results.querySelector(".cell--selected");
+      if (chosen) chosen.scrollIntoView({ block: "nearest", inline: "nearest" });
       reveal(title);
     }
 
@@ -686,6 +705,31 @@
       b.submit.disabled = busy;
       b.form.setAttribute("aria-busy", busy ? "true" : "false");
       if (busy) setChildren(b.submit, icon("spinner", "spinner"), "Booking...");
+      Array.prototype.forEach.call(results.querySelectorAll("button.cell"), function (cell) {
+        if (busy) cell.setAttribute("aria-disabled", "true");
+        else cell.removeAttribute("aria-disabled");
+      });
+    }
+
+    function refreshIfIdle() {
+      if (view && !searching) runSearch(view.query, true);
+    }
+
+    /* A reply for a form that was closed while its request was out (a new search
+     * or sign-out). It is never dropped silently: the outcome is noted beside the
+     * grid, and the grid is refreshed so it shows what the server now holds. */
+    function noteSupersededOutcome(b, reservation) {
+      var what = tablesLabel(b.restaurant, b.tableIds) + " at " + timeOf(b.startsAtLocal) +
+        " on " + formatDate(dateOf(b.startsAtLocal));
+      if (!booking) {
+        setChildren(panel, reservation
+          ? notice("success", "check", "Your earlier booking went through",
+            [what + ", reference " + reservation.reference + ". ",
+              h("a", { href: "/lookup?reference=" + encodeURIComponent(reservation.reference) }, "Manage booking")])
+          : notice("uncertain", "question", "We couldn't confirm your earlier booking",
+            what + " may or may not be booked. Check it under Look up before booking it again."));
+      }
+      refreshIfIdle();
     }
 
     function setSubmitLabel(b, text) { setChildren(b.submit, text); }
@@ -712,7 +756,16 @@
       }
       setBusy(b, true);
       api("POST", "/reservations", { body: b.body, key: b.key, auth: true }).then(function (res) {
-        if (booking !== b) return;  // the diner moved on to another table meanwhile
+        if (booking !== b) {
+          var made = (res.status === 200 || res.status === 201) && res.data ? res.data : null;
+          if (made) {
+            mine[made.reference] = made;
+            noteSupersededOutcome(b, made);
+          } else {
+            refreshIfIdle();  // a definitive refusal: nothing was booked
+          }
+          return;
+        }
         setBusy(b, false);
         if (res.status === 200 || res.status === 201) {
           showConfirmed(b, res.data);
@@ -727,7 +780,10 @@
         showBookingError(b, message[0], message[1]);
         if (res.code === "table_unavailable" && view) runSearch(view.query, true);
       }, function () {
-        if (booking !== b) return;
+        if (booking !== b) {
+          noteSupersededOutcome(b, null);
+          return;
+        }
         setBusy(b, false);
         showUncertain(b);
       });
@@ -771,7 +827,9 @@
       setChildren(b.confirmation);
       setChildren(b.status, notice("uncertain", "question", "We couldn't confirm this booking",
         "The connection dropped before Tablekeeper replied, so the table may or may not be booked. " +
-        "Press \u201cTry again\u201d to check: it is safe and will never book twice.", "booking-uncertain"));
+        "Press \u201cTry again\u201d without changing anything to check this same booking: it is safe and " +
+        "will never book twice. Changing the guests or the table starts a new booking request instead.",
+        "booking-uncertain"));
       setSubmitLabel(b, "Try again");
     }
 
