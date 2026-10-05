@@ -1,6 +1,7 @@
 """Seed the Vercel demo exactly once, when durable state does not exist yet."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -8,8 +9,8 @@ from urllib import error, request
 
 from tablekeeper.vercel_persistence import BlobStateStore
 
-PORT = 3000
-BASE = "http://127.0.0.1:3000"
+PORT = int(os.environ.get("PORT") or 8080)
+BASE = f"http://127.0.0.1:{PORT}"
 
 
 def wait_for_health() -> None:
