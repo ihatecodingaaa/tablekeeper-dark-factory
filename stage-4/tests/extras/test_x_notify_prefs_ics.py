@@ -207,3 +207,49 @@ def test_google_calendar_link(w):
     url = w.ok("GET", f"/x/evening/{b['reference']}", "u_ada")["calendar"]["google_url"]
     assert url.startswith("https://calendar.google.com/calendar/render?action=TEMPLATE&")
     assert "dates=20260924T170000Z%2F20260924T183000Z" in url
+
+
+def _telegram_world(monkeypatch, sender):
+    monkeypatch.setenv("TK_TELEGRAM_BOT_TOKEN", "test-only")
+    monkeypatch.setenv("TK_TELEGRAM_CHAT_ID", "1")
+    monkeypatch.setitem(notify.SENDERS, "telegram", sender)
+    w = XWorld()
+    w.ok("PUT", "/x/me/preferences", "u_ada", {"channel": "telegram"})
+    return w
+
+
+def _book_many(w, n):
+    import itertools
+    combos = itertools.product(["2026-09-24", "2026-09-25", "2026-09-26", "2026-09-27"],
+                               ["18:00", "19:30", "21:00"], ["t_1", "t_2", "t_3"])
+    for _, (day, at, table) in zip(range(n), combos):
+        w.book(date=day, at=at, table=table, party=2)
+
+
+def test_slow_adapter_uses_a_bounded_worker_pool(monkeypatch):
+    import threading
+    gate = threading.Event()
+    w = _telegram_world(monkeypatch, lambda to, subject, body: gate.wait(10))
+    before = threading.active_count()
+    started = time.perf_counter()
+    _book_many(w, 30)
+    elapsed = time.perf_counter() - started
+    grown = threading.active_count() - before
+    gate.set()
+    assert elapsed < 3.0, elapsed                      # bookings never wait for delivery
+    assert grown <= notify.MAX_WORKERS, grown          # no thread per notification
+    assert _wait_for(w, lambda: all(e["delivery_state"] == "sent" for e in w.extras.outbox
+                                    if e["channel"] == "telegram"), seconds=15)
+
+
+def test_queue_overflow_marks_entries_failed_instead_of_growing(monkeypatch):
+    import threading
+    gate = threading.Event()
+    monkeypatch.setattr(notify, "QUEUE_LIMIT", 3)
+    w = _telegram_world(monkeypatch, lambda to, subject, body: gate.wait(10))
+    _book_many(w, 12)
+    with w.svc._lock:
+        states = [e["delivery_state"] for e in w.extras.outbox if e["channel"] == "telegram"]
+    gate.set()
+    assert states.count("failed") >= 12 - 3 - notify.MAX_WORKERS
+    assert all(s in ("queued", "failed") for s in states)

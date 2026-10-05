@@ -5,8 +5,10 @@ order: route match (404, 405), authentication for protected routes (401), body
 parsing (400), then the service call. Every 4xx/5xx carries the envelope
 {"error": {"code": ..., "message": ...}}; 204 responses carry no body.
 
-The browser screens (/, /signup, /login, /lookup) are HTML pages composed from
-tablekeeper/web/; their scripts and styles are served from /assets/.
+The browser screens (/, /signup, /login, /lookup, and the extras /evening/{ref},
+/passport, /notifications, /control-room, /simulator) are HTML pages composed from
+tablekeeper/web/; their scripts and styles are served from /assets/. Any /x/... path
+that no official route claims is handed to the extras dispatcher.
 """
 from __future__ import annotations
 
@@ -19,6 +21,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .errors import ApiError, malformed, not_found
+from .extras import routes as extras_routes
 from .service import Service
 
 JSON_TYPE = "application/json; charset=utf-8"
@@ -28,6 +31,8 @@ ASSET_TYPES = {
     ".css": "text/css; charset=utf-8",
     ".js": "text/javascript; charset=utf-8",
     ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".webmanifest": "application/manifest+json",
 }
 NON_JSON_HEADERS = {
     "Cache-Control": "no-cache",
@@ -60,10 +65,10 @@ def _load_assets() -> dict:
 
 ASSETS = _load_assets()
 LAYOUT = (WEB_DIR / "layout.html").read_text(encoding="utf-8")
-SCREENS = {name: (WEB_DIR / "screens" / f"{name}.html").read_text(encoding="utf-8")
-           for name in ("search", "signup", "login", "lookup")}
 TITLES = {"search": "Find a table", "signup": "Create an account", "login": "Sign in",
-          "lookup": "Look up a reservation"}
+          "lookup": "Look up a reservation", "evening": "My evening", "passport": "My evenings",
+          "notifications": "Messages", "control-room": "Control room", "simulator": "Recovery simulator"}
+SCREENS = {name: (WEB_DIR / "screens" / f"{name}.html").read_text(encoding="utf-8") for name in TITLES}
 _PLACEHOLDER = re.compile(r"\{\{([A-Z_]+)\}\}")
 
 
@@ -91,6 +96,11 @@ def _asset(svc, rq):
     if asset is None:
         raise not_found("no such asset")
     return 200, asset
+
+
+def _screen(name):
+    """A route handler that serves one static screen; its script loads the data."""
+    return lambda svc, rq: (200, render_page(name))
 
 # Body handling per endpoint.
 NO_BODY = None   # any request body is ignored
@@ -140,6 +150,11 @@ ROUTES = [
     (("signup",), {"GET": (lambda s, r: (200, render_page("signup")), False, NO_BODY)}),
     (("login",), {"GET": (lambda s, r: (200, render_page("login")), False, NO_BODY)}),
     (("lookup",), {"GET": (lambda s, r: (200, render_page("lookup")), False, NO_BODY)}),
+    (("evening", None), {"GET": (_screen("evening"), False, NO_BODY)}),
+    (("passport",), {"GET": (_screen("passport"), False, NO_BODY)}),
+    (("notifications",), {"GET": (_screen("notifications"), False, NO_BODY)}),
+    (("control-room",), {"GET": (_screen("control-room"), False, NO_BODY)}),
+    (("simulator",), {"GET": (_screen("simulator"), False, NO_BODY)}),
     (("assets", None), {"GET": (_asset, False, NO_BODY)}),
     (("health",), {"GET": (_health, False, NO_BODY)}),
     (("_test", "reset"), {"POST": (_reset, False, ANY_JSON)}),
@@ -275,6 +290,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = urlsplit(self.path)
         route = match_route(parts.path)
         if route is None:
+            if parts.path.startswith("/x/"):
+                return self._extras(parts, raw)
             raise not_found("no such resource")
         methods, params = route
         endpoint = methods.get(self.command)
@@ -294,6 +311,17 @@ class Handler(BaseHTTPRequestHandler):
             if body_mode == OBJECT and not isinstance(rq.body, dict):
                 raise malformed("request body must be a JSON object")
         return handler(service, rq)
+
+    def _extras(self, parts, raw: bytes):
+        """The additive /x API: reached only when no official route matched the path."""
+        result = extras_routes.handle(self.server.service, self.command, parts.path,
+                                      parse_qs(parts.query, keep_blank_values=True), self.headers, raw)
+        if result is None:
+            raise not_found("no such resource")
+        status, body, content_type = result
+        if isinstance(body, (bytes, bytearray)):
+            return status, Raw(content_type, bytes(body))  # e.g. the calendar file
+        return status, body
 
     def _read_body(self) -> bytes:
         # Always consume the whole body, even for requests that fail before

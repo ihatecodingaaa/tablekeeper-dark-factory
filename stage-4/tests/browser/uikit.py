@@ -1,11 +1,32 @@
 """Shared data and helpers for the Playwright browser tests."""
+import atexit
 import datetime as dt
 import http.client
 import json
 
-from playwright.sync_api import expect
+from playwright.sync_api import expect, sync_playwright
 
 PASSWORD = "correct horse"
+_PLAYWRIGHT = None
+_BROWSER = None
+
+
+def shared_browser():
+    """One Chromium per test process. Several test folders (browser, browser_x) need a
+    browser, and the sync API cannot run two Playwright instances in one thread."""
+    global _PLAYWRIGHT, _BROWSER
+    if _BROWSER is None:
+        _PLAYWRIGHT = sync_playwright().start()
+        _BROWSER = _PLAYWRIGHT.chromium.launch()
+        atexit.register(_close_browser)
+    return _BROWSER
+
+
+def _close_browser():
+    if _BROWSER is not None:
+        _BROWSER.close()
+    if _PLAYWRIGHT is not None:
+        _PLAYWRIGHT.stop()
 
 
 def sign_in(page, email="ada@example.com", password=PASSWORD):

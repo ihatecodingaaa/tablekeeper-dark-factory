@@ -1,4 +1,4 @@
-"""Browser fixtures: the real service in-process, driven by Playwright Chromium."""
+"""Browser fixtures for the extras screens: the real service in-process, driven by Chromium."""
 import sys
 import threading
 from pathlib import Path
@@ -7,7 +7,7 @@ import pytest
 
 STAGE_DIR = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-for entry in (STAGE_DIR, HERE):
+for entry in (STAGE_DIR, HERE, HERE.parent / "browser"):
     if str(entry) not in sys.path:
         sys.path.insert(0, str(entry))
 
@@ -42,8 +42,10 @@ def api(base_url):
 
 @pytest.fixture
 def page(browser, base_url, api):
-    """A fresh browser context per test. Any script error fails the test."""
-    context = browser.new_context(base_url=base_url, viewport={"width": 1280, "height": 900})
+    """A fresh context per test with clipboard access. Any script error fails the test."""
+    context = browser.new_context(base_url=base_url, viewport={"width": 1280, "height": 900},
+                                  accept_downloads=True)
+    context.grant_permissions(["clipboard-read", "clipboard-write"], origin=base_url)
     pg = context.new_page()
     errors = []
     pg.on("pageerror", lambda exc: errors.append(f"pageerror: {exc}"))
