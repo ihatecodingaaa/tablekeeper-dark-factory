@@ -165,6 +165,19 @@ def test_every_booking_state_keeps_the_page_still_at_375(page, api):
         assert no_horizontal_page_scroll(page)
 
 
+@pytest.mark.parametrize("testid", ["slot-t_3-20:00", "slot-t_2-18:00", "slot-t_garden-20:30",
+                                    "slot-t_1+t_2-19:00"])
+def test_a_selected_cell_is_fully_in_view_at_375(page, testid):
+    sign_in(page)
+    page.set_viewport_size({"width": 375, "height": 812})
+    page.goto("/")
+    search(page, future_date(), party_size=2)
+    page.get_by_test_id(testid).click()
+    expect(page.get_by_test_id(testid)).to_have_attribute("aria-pressed", "true")
+    assert_in_grid_view(page, testid)
+    assert no_horizontal_page_scroll(page)
+
+
 def test_reduced_motion_is_respected(browser, base_url, api):
     context = browser.new_context(base_url=base_url, reduced_motion="reduce")
     try:

@@ -695,7 +695,7 @@
       workspace.classList.add("workspace--booking");
       renderGrid();
       // Keep the chosen cell visible inside the grid's own sideways scroller.
-      var chosen = results.querySelector(".cell--selected");
+      var chosen = results.querySelector('[data-testid="availability-grid"] .cell--selected');
       if (chosen) chosen.scrollIntoView({ block: "nearest", inline: "nearest" });
       reveal(title);
     }
