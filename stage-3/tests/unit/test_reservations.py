@@ -8,7 +8,8 @@ from tk_unit import (DATE, NOW, UTC, Clock, all_week, api_error, assert_error, b
                      make_world, restaurant)
 
 RESERVATION_KEYS = {"reservation_id", "reference", "restaurant_id", "table_id", "table_ids", "party_size",
-                    "status", "starts_at_local", "starts_at", "ends_at", "created_at"}
+                    "status", "starts_at_local", "starts_at", "ends_at", "created_at",
+                    "revision", "accepted_terms"}
 
 
 # -- create -------------------------------------------------------------------
@@ -248,7 +249,7 @@ def test_get_other_users_or_unknown_reservation_is_404(world):
 def test_cancel_returns_full_cancelled_reservation_and_frees_table(world):
     out = world.booked(table_id="t_2", at="19:00")
     cancelled = world.svc.cancel_reservation(world.ada, out["reference"])
-    assert cancelled == dict(out, status="cancelled")
+    assert cancelled == dict(out, status="cancelled", revision=2)
     assert "t_2" in world.slots("2")["19:00"]
     world.booked(world.bob, table_id="t_2", at="19:00")
 

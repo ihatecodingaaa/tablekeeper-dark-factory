@@ -16,14 +16,16 @@ import secrets
 from . import passwords, timeutil
 from .errors import malformed, validation
 
-SCHEMA = 2                 # stage 2; schema 1 (stage-1 exports) is upgraded on import
-SCHEMAS = (1, 2)
+SCHEMA = 3                 # stage 3; schemas 1 and 2 (earlier exports) are upgraded on import
+SCHEMAS = (1, 2, 3)
 MAX_ID = 64
 MAX_KEY = 255
 REFERENCE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 REFERENCE_LENGTH = 8
 STATUSES = ("confirmed", "cancelled")
-IDEMPOTENT_PATHS = ("/reservations", "/reservation-moves")
+EVENTS = ("created", "changed", "cancelled")
+IDEMPOTENT_PATHS = ("/reservations", "/reservation-moves", "/series")
+_POLICY_PATH_RE = re.compile(r"/restaurants/.{1,64}/policies", re.DOTALL)
 _REFERENCE_RE = re.compile(r"[A-Z0-9]{6,12}")
 STAGE1_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_id",
                  "party_size", "status", "starts_at_local", "starts_at",
@@ -31,6 +33,9 @@ STAGE1_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_id",
 STAGE2_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_ids",
                  "party_size", "status", "starts_at_local", "starts_at",
                  "ends_at", "created_at")
+STAGE3_FIELDS = STAGE2_FIELDS + ("revision", "accepted_terms")
+TERM_FIELDS = ("policy_version", "slot_minutes", "reservation_duration_minutes",
+               "cancellation_cutoff_minutes", "opening_hours", "capacities")
 
 
 def table_fields(table_ids) -> dict:
@@ -91,10 +96,119 @@ def canonical_json(value) -> str:
         raise malformed("request body is too deeply nested or not plain JSON") from None
 
 
-class Restaurant:
-    """A restaurant's configuration with parsed opening windows."""
+def cutoff_passed(start: dt.datetime, now: dt.datetime, cutoff_minutes: int) -> bool:
+    """R3: changes are allowed only while now < start - cutoff.
 
-    def __init__(self, raw):
+    Compared as a duration, so a cutoff of any size is safe: start - cutoff is
+    never computed, and a cutoff wider than the lead time counts as passed.
+    """
+    return (start - now).total_seconds() <= cutoff_minutes * 60
+
+
+def parse_opening_hours(hours, *, unique_weekdays: bool):
+    """Validate stage-1 opening hours; return (normalised list, windows by weekday)."""
+    _require(isinstance(hours, list), "opening_hours must be a list")
+    normalised, windows = [], {}
+    for entry in hours:
+        _require(isinstance(entry, dict), "opening_hours entries must be objects")
+        weekday = entry.get("weekday")
+        _require(weekday in timeutil.WEEKDAYS, "weekday must be one of mon..sun")
+        _require(not (unique_weekdays and weekday in windows),
+                 "opening_hours must not repeat a weekday")
+        opens = timeutil.parse_hhmm(entry.get("opens"))
+        closes = timeutil.parse_hhmm(entry.get("closes"), allow_24=True)
+        _require(opens is not None and closes is not None and opens < closes,
+                 "opens/closes must be HH:MM with closes later than opens")
+        normalised.append({"weekday": weekday, "opens": entry["opens"],
+                           "closes": entry["closes"]})
+        windows.setdefault(weekday, []).append((opens, closes))
+    for spans in windows.values():
+        spans.sort()
+    return normalised, windows
+
+
+class Policy:
+    """A complete set of booking rules. Version 0 is the fixture's own rules."""
+
+    __slots__ = ("version", "effective_from", "slot_minutes", "duration_minutes",
+                 "cutoff_minutes", "opening_hours", "windows", "capacities")
+
+    def __init__(self, version, effective_from, slot_minutes, duration_minutes,
+                 cutoff_minutes, opening_hours, windows, capacities):
+        self.version = version
+        self.effective_from = effective_from      # dt.date, None for policy 0
+        self.slot_minutes = slot_minutes
+        self.duration_minutes = duration_minutes
+        self.cutoff_minutes = cutoff_minutes
+        self.opening_hours = opening_hours
+        self.windows = windows
+        self.capacities = capacities              # table id -> capacity, fixture order
+
+    @classmethod
+    def from_body(cls, body: dict, table_order: list[str], version: int) -> "Policy":
+        """Validate a published policy (S3-R2 step 7); InvalidState on any problem."""
+        _require(isinstance(body, dict), "policy must be an object")
+        for field in ("effective_from", "slot_minutes", "reservation_duration_minutes",
+                      "cancellation_cutoff_minutes", "opening_hours", "capacities"):
+            _require(field in body, f"{field} is required")
+        effective = timeutil.parse_date(body["effective_from"])
+        _require(effective is not None, "effective_from must be a real YYYY-MM-DD date")
+        slot = body["slot_minutes"]
+        _require(is_int(slot) and 1 <= slot <= 1440, "slot_minutes must be an integer 1..1440")
+        duration = body["reservation_duration_minutes"]
+        _require(is_int(duration) and 1 <= duration <= 1440,
+                 "reservation_duration_minutes must be an integer 1..1440")
+        cutoff = body["cancellation_cutoff_minutes"]
+        _require(is_int(cutoff) and 0 <= cutoff <= 10080,
+                 "cancellation_cutoff_minutes must be an integer 0..10080")
+        hours, windows = parse_opening_hours(body["opening_hours"], unique_weekdays=True)
+        raw_caps = body["capacities"]
+        _require(isinstance(raw_caps, dict) and set(raw_caps) == set(table_order),
+                 "capacities must name exactly the restaurant's tables")
+        for table_id in table_order:
+            value = raw_caps[table_id]
+            _require(is_int(value) and 1 <= value <= 100, "capacities must be integers 1..100")
+        capacities = {table_id: raw_caps[table_id] for table_id in table_order}
+        return cls(version, effective, slot, duration, cutoff, hours, windows, capacities)
+
+    def terms(self) -> dict:
+        """accepted_terms: the whole policy minus effective_from."""
+        return {
+            "policy_version": self.version,
+            "slot_minutes": self.slot_minutes,
+            "reservation_duration_minutes": self.duration_minutes,
+            "cancellation_cutoff_minutes": self.cutoff_minutes,
+            "opening_hours": copy.deepcopy(self.opening_hours),
+            "capacities": dict(self.capacities),
+        }
+
+    def public(self) -> dict:
+        """A published policy as POST returns it and GET lists it."""
+        return {
+            "effective_from": self.effective_from.isoformat(),
+            "slot_minutes": self.slot_minutes,
+            "reservation_duration_minutes": self.duration_minutes,
+            "cancellation_cutoff_minutes": self.cutoff_minutes,
+            "opening_hours": copy.deepcopy(self.opening_hours),
+            "capacities": dict(self.capacities),
+            "policy_version": self.version,
+        }
+
+    def windows_on(self, day: dt.date) -> list[tuple[int, int]]:
+        return self.windows.get(timeutil.weekday_of(day), [])
+
+    def end_of(self, start: dt.datetime) -> dt.datetime | None:
+        """start + this policy's duration (absolute), None if out of datetime range."""
+        return timeutil.plus_minutes(start, self.duration_minutes)
+
+    def capacity_of(self, table_ids) -> int:
+        return sum(self.capacities[t] for t in table_ids)
+
+
+class Restaurant:
+    """A restaurant's fixture configuration, policy 0 and published policies."""
+
+    def __init__(self, raw, user_ids=None):
         _require(isinstance(raw, dict), "restaurant must be an object")
         self.id = raw.get("id")
         _require(valid_id(self.id), "restaurant id must be a string of 1..64 characters")
@@ -113,24 +227,8 @@ class Restaurant:
         self.cutoff_minutes = raw.get("cancellation_cutoff_minutes")
         _require(is_int(self.cutoff_minutes) and self.cutoff_minutes >= 0,
                  "cancellation_cutoff_minutes must be a non-negative integer")
-
-        hours = raw.get("opening_hours", [])
-        _require(isinstance(hours, list), "opening_hours must be a list")
-        self.opening_hours = []
-        self.windows: dict[str, list[tuple[int, int]]] = {}
-        for entry in hours:
-            _require(isinstance(entry, dict), "opening_hours entries must be objects")
-            weekday = entry.get("weekday")
-            _require(weekday in timeutil.WEEKDAYS, "weekday must be one of mon..sun")
-            opens = timeutil.parse_hhmm(entry.get("opens"))
-            closes = timeutil.parse_hhmm(entry.get("closes"), allow_24=True)
-            _require(opens is not None and closes is not None and opens < closes,
-                     "opens/closes must be HH:MM with closes later than opens")
-            self.opening_hours.append({"weekday": weekday, "opens": entry["opens"],
-                                       "closes": entry["closes"]})
-            self.windows.setdefault(weekday, []).append((opens, closes))
-        for spans in self.windows.values():
-            spans.sort()
+        self.opening_hours, windows = parse_opening_hours(raw.get("opening_hours", []),
+                                                          unique_weekdays=False)
 
         tables = raw.get("tables", [])
         _require(isinstance(tables, list), "tables must be a list")
@@ -167,10 +265,28 @@ class Restaurant:
             self.pairs[key] = (first, second)
             self.combinable.append([first, second])
 
+        managers = raw.get("manager_user_ids", [])
+        managers = [] if managers is None else managers
+        _require(isinstance(managers, list) and all(valid_id(m) for m in managers),
+                 "manager_user_ids must be a list of user ids")
+        if user_ids is not None:
+            _require(all(m in user_ids for m in managers),
+                     "manager_user_ids must name fixture users")
+        self.managers: list[str] = list(dict.fromkeys(managers))
+
+        self.policy0 = Policy(0, None, self.slot_minutes, self.duration_minutes,
+                              self.cutoff_minutes, copy.deepcopy(self.opening_hours), windows,
+                              {t["id"]: t["capacity"] for t in self.tables})
+        self.policies: list[Policy] = []
+
+    def table_order(self) -> list[str]:
+        return [t["id"] for t in self.tables]
+
     def summary(self) -> dict:
         return {"id": self.id, "name": self.name, "timezone": self.timezone}
 
     def detail(self) -> dict:
+        """The original fixture configuration (policies never change it)."""
         return {
             "id": self.id,
             "name": self.name,
@@ -182,6 +298,17 @@ class Restaurant:
             "tables": copy.deepcopy(self.tables),
             "combinable": copy.deepcopy(self.combinable),
         }
+
+    def policy_for(self, day: dt.date) -> Policy:
+        """S3-R1: greatest effective_from <= day, ties by greatest version; else policy 0."""
+        best = self.policy0
+        for policy in self.policies:
+            if policy.effective_from <= day and (
+                    best.version == 0
+                    or (policy.effective_from, policy.version)
+                    > (best.effective_from, best.version)):
+                best = policy
+        return best
 
     def canonical_tables(self, table_ids) -> list[str] | None:
         """The stored order of a set of this restaurant's tables.
@@ -196,37 +323,20 @@ class Restaurant:
             return list(pair) if pair else None
         return None
 
-    def capacity_of(self, table_ids) -> int:
-        return sum(self.table_index[t]["capacity"] for t in table_ids)
-
-    def windows_on(self, day: dt.date) -> list[tuple[int, int]]:
-        return self.windows.get(timeutil.weekday_of(day), [])
-
-    def end_of(self, start: dt.datetime) -> dt.datetime | None:
-        """start + reservation duration (absolute), None if out of datetime range."""
-        return timeutil.plus_minutes(start, self.duration_minutes)
-
-    def cutoff_passed(self, start: dt.datetime, now: dt.datetime) -> bool:
-        """R3: changes are allowed only while now < start - cutoff.
-
-        Compared as a duration, so a cutoff of any size is safe: start - cutoff
-        is never computed, and a cutoff wider than the lead time counts as passed.
-        """
-        return (start - now).total_seconds() <= self.cutoff_minutes * 60
-
 
 class Reservation:
-    """One booking: its public response fields plus owner and parsed instants."""
+    """One booking: its public view fields, owner, parsed instants and history."""
 
-    __slots__ = ("public", "user_id", "start", "end", "seq")
+    __slots__ = ("public", "user_id", "start", "end", "seq", "history")
 
     def __init__(self, public: dict, user_id: str, start: dt.datetime,
-                 end: dt.datetime, seq: int):
+                 end: dt.datetime, seq: int, history=None):
         self.public = public
         self.user_id = user_id
         self.start = start
         self.end = end
         self.seq = seq
+        self.history: list[dict] = history if history is not None else []
 
     @property
     def id(self) -> str:
@@ -248,8 +358,41 @@ class Reservation:
     def confirmed(self) -> bool:
         return self.public["status"] == "confirmed"
 
+    @property
+    def revision(self) -> int:
+        return self.public["revision"]
+
+    @property
+    def terms(self) -> dict:
+        return self.public["accepted_terms"]
+
     def view(self) -> dict:
-        return dict(self.public)
+        return copy.deepcopy(self.public)
+
+
+def history_entry(seq: int, at: str, event: str, changes: list, reservation: Reservation) -> dict:
+    """A history entry carrying the reservation's revision and terms after the event."""
+    return {"seq": seq, "at": at, "event": event, "changes": changes,
+            "revision": reservation.revision,
+            "accepted_terms": copy.deepcopy(reservation.terms)}
+
+
+def created_changes(public: dict) -> list:
+    ids = public["table_ids"]
+    first = ({"field": "table_id", "from": None, "to": ids[0]} if len(ids) == 1
+             else {"field": "table_ids", "from": None, "to": list(ids)})
+    return [first,
+            {"field": "starts_at_local", "from": None, "to": public["starts_at_local"]},
+            {"field": "party_size", "from": None, "to": public["party_size"]}]
+
+
+def synthesize_history(reservation: Reservation) -> None:
+    """S3-R6: seeded/imported bookings get created (and cancelled) at created_at."""
+    at = reservation.public["created_at"]
+    reservation.history = [history_entry(1, at, "created", created_changes(reservation.public),
+                                         reservation)]
+    if not reservation.confirmed:
+        reservation.history.append(history_entry(2, at, "cancelled", [], reservation))
 
 
 class State:
@@ -258,9 +401,11 @@ class State:
         self.emails: dict[str, str] = {}
         self.tokens: dict[str, str] = {}
         self.restaurants: dict[str, Restaurant] = {}
+        self.restaurant_revisions: dict[str, int] = {}
         self.reservations: dict[str, Reservation] = {}
         self.references: dict[str, str] = {}
         self.idempotency: dict[tuple[str, str, str, str], dict] = {}
+        self.series: dict = {}
         self.seq = 0
 
     # -- identifiers -------------------------------------------------------
@@ -294,6 +439,11 @@ class State:
         self.users[user["id"]] = user
         self.emails[user["email"].lower()] = user["id"]
 
+    def add_restaurant(self, restaurant: Restaurant) -> None:
+        _require(restaurant.id not in self.restaurants, "duplicate restaurant id")
+        self.restaurants[restaurant.id] = restaurant
+        self.restaurant_revisions.setdefault(restaurant.id, 0)
+
     def add_reservation(self, reservation: Reservation) -> None:
         self.reservations[reservation.id] = reservation
         self.references[reservation.reference] = reservation.id
@@ -305,14 +455,19 @@ class State:
     # -- export --------------------------------------------------------------
 
     def export(self) -> dict:
+        from . import series  # late: series.py builds on this module
         return {
             "schema": SCHEMA,
             "seq": self.seq,
             "users": [dict(u) for u in self.users.values()],
             "tokens": [{"token_sha256": digest, "user_id": uid}
                        for digest, uid in self.tokens.items()],
-            "restaurants": [r.detail() for r in self.restaurants.values()],
-            "reservations": [dict(r.public, user_id=r.user_id, seq=r.seq)
+            "restaurants": [dict(r.detail(), manager_user_ids=list(r.managers),
+                                 policies=[p.public() for p in r.policies])
+                            for r in self.restaurants.values()],
+            "restaurant_revisions": dict(self.restaurant_revisions),
+            "reservations": [dict(copy.deepcopy(r.public), user_id=r.user_id, seq=r.seq,
+                                  history=copy.deepcopy(r.history))
                              for r in self.reservations.values()],
             "idempotency": [
                 {"user_id": scope[0], "method": scope[1], "path": scope[2],
@@ -320,18 +475,11 @@ class State:
                  "response": copy.deepcopy(record["response"])}
                 for scope, record in self.idempotency.items()
             ],
+            "series": series.export_records(self),
         }
 
 
 # -- builders ------------------------------------------------------------------
-
-
-def _add_restaurants(state: State, restaurants) -> None:
-    _require(isinstance(restaurants, list), "restaurants must be a list")
-    for raw in restaurants:
-        restaurant = Restaurant(raw)
-        _require(restaurant.id not in state.restaurants, "duplicate restaurant id")
-        state.restaurants[restaurant.id] = restaurant
 
 
 def _resolve_times(restaurant: Restaurant, starts_at_local):
@@ -339,7 +487,7 @@ def _resolve_times(restaurant: Restaurant, starts_at_local):
     _require(naive is not None, "starts_at_local must be YYYY-MM-DDTHH:MM")
     start = timeutil.resolve_local(naive, restaurant.zone)
     _require(start is not None, "starts_at_local does not exist in the restaurant zone")
-    end = restaurant.end_of(start)
+    end = restaurant.policy0.end_of(start)
     _require(end is not None, "reservation end is out of range")
     return start, end
 
@@ -391,6 +539,12 @@ def prepare_fixture(fixture):
         raise validation(str(exc)) from None
 
 
+def _upgraded_public(public: dict, restaurant: Restaurant) -> None:
+    """Seeded and stage-1/2 bookings: revision 1 under policy 0 (S3-R3)."""
+    public["revision"] = 1
+    public["accepted_terms"] = restaurant.policy0.terms()
+
+
 def build_from_fixture(fixture: dict, users: list[dict], hashes: list[str],
                        now: dt.datetime) -> State:
     """Build a State from a fixture already checked by prepare_fixture."""
@@ -399,7 +553,10 @@ def build_from_fixture(fixture: dict, users: list[dict], hashes: list[str],
         for user, digest in zip(users, hashes):
             state.add_user(dict(user, password_hash=digest))
         restaurants = fixture.get("restaurants", [])
-        _add_restaurants(state, [] if restaurants is None else restaurants)
+        restaurants = [] if restaurants is None else restaurants
+        _require(isinstance(restaurants, list), "restaurants must be a list")
+        for raw in restaurants:
+            state.add_restaurant(Restaurant(raw, user_ids=state.users))
         reservations = fixture.get("reservations", [])
         reservations = [] if reservations is None else reservations
         _require(isinstance(reservations, list), "reservations must be a list")
@@ -446,16 +603,74 @@ def build_from_fixture(fixture: dict, users: list[dict], hashes: list[str],
                 "ends_at": timeutil.to_rfc3339(end, restaurant.zone),
                 "created_at": created_at,
             }
-            state.add_reservation(Reservation(public, user_id, start, end, state.next_seq()))
+            _upgraded_public(public, restaurant)
+            reservation = Reservation(public, user_id, start, end, state.next_seq())
+            synthesize_history(reservation)
+            state.add_reservation(reservation)
         return state
     except InvalidState as exc:
         raise validation(str(exc)) from None
 
 
+def _check_terms(terms) -> None:
+    _require(isinstance(terms, dict) and set(terms) == set(TERM_FIELDS),
+             "accepted_terms must carry exactly the policy terms")
+    _require(is_int(terms["policy_version"]) and terms["policy_version"] >= 0,
+             "accepted_terms policy_version invalid")
+    for field in ("slot_minutes", "reservation_duration_minutes"):
+        _require(is_int(terms[field]) and terms[field] >= 1, f"accepted_terms {field} invalid")
+    _require(is_int(terms["cancellation_cutoff_minutes"])
+             and terms["cancellation_cutoff_minutes"] >= 0, "accepted_terms cutoff invalid")
+    parse_opening_hours(terms["opening_hours"], unique_weekdays=False)
+    caps = terms["capacities"]
+    _require(isinstance(caps, dict) and all(isinstance(k, str) and is_int(v) and v >= 1
+                                            for k, v in caps.items()),
+             "accepted_terms capacities invalid")
+
+
+def _check_history(history, public) -> None:
+    _require(isinstance(history, list) and history, "history must be a non-empty list")
+    last_at = None
+    for index, entry in enumerate(history, start=1):
+        _require(isinstance(entry, dict), "history entry must be an object")
+        _require(entry.get("seq") == index and is_int(entry.get("seq")),
+                 "history seq must count from 1")
+        at = timeutil.parse_rfc3339(entry.get("at"))
+        _require(at is not None and (last_at is None or at >= last_at),
+                 "history at must be non-decreasing timestamps")
+        last_at = at
+        _require(entry.get("event") in EVENTS, "history event invalid")
+        _require(isinstance(entry.get("changes"), list), "history changes must be a list")
+        for change in entry["changes"]:
+            _require(isinstance(change, dict) and set(change) == {"field", "from", "to"},
+                     "history change invalid")
+        _require(is_int(entry.get("revision")) and entry["revision"] >= 1,
+                 "history revision invalid")
+        _check_terms(entry.get("accepted_terms"))
+        _require(set(entry) == {"seq", "at", "event", "changes", "revision", "accepted_terms"},
+                 "history entry has unexpected fields")
+    _require(history[0]["event"] == "created", "history starts with created")
+    _require(history[-1]["revision"] == public["revision"],
+             "history ends at the current revision")
+
+
+def _import_restaurant(raw, schema: int, user_ids) -> Restaurant:
+    restaurant = Restaurant(raw, user_ids=user_ids)
+    if schema >= 3:
+        policies = raw.get("policies")
+        _require(isinstance(policies, list), "restaurant policies must be a list")
+        for index, body in enumerate(policies, start=1):
+            _require(isinstance(body, dict) and body.get("policy_version") == index
+                     and is_int(body.get("policy_version")), "policy versions must count from 1")
+            restaurant.policies.append(Policy.from_body(body, restaurant.table_order(), index))
+    return restaurant
+
+
 def build_from_export(document) -> State:
     """Validate an export document strictly and build a State from it.
 
-    Raises ApiError 422 (validation_failed) on any problem.
+    Accepts stage-1 (schema 1), stage-2 (schema 2) and stage-3 (schema 3) state;
+    earlier schemas are upgraded in memory. Raises ApiError 422 on any problem.
     """
     try:
         _require(isinstance(document, dict), "import body must be a JSON object")
@@ -496,17 +711,27 @@ def build_from_export(document) -> State:
             _require(uid in state.users, "token names an unknown user")
             state.tokens[digest] = uid
 
-        _add_restaurants(state, raw.get("restaurants"))
+        restaurants = raw.get("restaurants")
+        _require(isinstance(restaurants, list), "restaurants must be a list")
+        for entry in restaurants:
+            state.add_restaurant(_import_restaurant(entry, schema, state.users))
+        if schema >= 3:
+            revisions = raw.get("restaurant_revisions")
+            _require(isinstance(revisions, dict), "restaurant_revisions must be an object")
+            for rid, value in revisions.items():
+                _require(rid in state.restaurants and is_int(value) and value >= 0,
+                         "restaurant_revisions invalid")
+                state.restaurant_revisions[rid] = value
 
         reservations = raw.get("reservations")
         _require(isinstance(reservations, list), "reservations must be a list")
+        fields = {1: STAGE1_FIELDS, 2: STAGE2_FIELDS, 3: STAGE3_FIELDS}[schema]
         for entry in reservations:
             _require(isinstance(entry, dict), "reservation must be an object")
-            fields = STAGE1_FIELDS if schema == 1 else STAGE2_FIELDS
             public = {}
             for field in fields:
                 _require(field in entry, f"reservation is missing {field}")
-                public[field] = entry[field]
+                public[field] = copy.deepcopy(entry[field])
             _require(valid_id(public["reservation_id"])
                      and public["reservation_id"] not in state.reservations,
                      "reservation_id invalid or duplicate")
@@ -548,7 +773,18 @@ def build_from_export(document) -> State:
             _require(valid_id(user_id), "reservation user_id invalid")
             rseq = entry.get("seq", 0)
             _require(is_int(rseq) and rseq >= 0, "reservation seq invalid")
-            state.add_reservation(Reservation(public, user_id, start, end, rseq))
+            if schema < 3:
+                _upgraded_public(public, restaurant)
+                reservation = Reservation(public, user_id, start, end, rseq)
+                synthesize_history(reservation)
+            else:
+                _require(is_int(public["revision"]) and public["revision"] >= 1,
+                         "revision must be a positive integer")
+                _check_terms(public["accepted_terms"])
+                history = copy.deepcopy(entry.get("history"))
+                _check_history(history, public)
+                reservation = Reservation(public, user_id, start, end, rseq, history)
+            state.add_reservation(reservation)
             seq = max(seq, rseq)
         state.seq = seq
 
@@ -559,7 +795,8 @@ def build_from_export(document) -> State:
             uid, method = record.get("user_id"), record.get("method")
             path, key = record.get("path"), record.get("key")
             _require(valid_id(uid), "idempotency user_id invalid")
-            _require(method == "POST" and path in IDEMPOTENT_PATHS,
+            _require(method == "POST" and isinstance(path, str)
+                     and (path in IDEMPOTENT_PATHS or _POLICY_PATH_RE.fullmatch(path)),
                      "idempotency method/path invalid")
             _require(isinstance(key, str) and 0 < len(key) <= MAX_KEY,
                      "idempotency key invalid")
@@ -572,6 +809,9 @@ def build_from_export(document) -> State:
             _require(scope not in state.idempotency, "duplicate idempotency record")
             state.idempotency[scope] = {"body": record["body"], "status": status,
                                         "response": copy.deepcopy(record["response"])}
+
+        from . import series  # late: series.py builds on this module
+        series.import_records(copy.deepcopy(raw.get("series")) if schema >= 3 else None, state)
         return state
     except InvalidState as exc:
         raise validation(str(exc)) from None
