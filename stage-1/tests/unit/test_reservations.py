@@ -436,3 +436,12 @@ def test_amend_table_id_over_64_characters_is_422(world):
     out = world.booked()
     err = api_error(world.svc.amend_reservation, world.ada, out["reference"], {"table_id": "t" * 65})
     assert_error(err, 422, "validation_failed")
+
+
+def test_every_generated_reference_matches_spec_format(clock):
+    tables = [{"id": f"t_{i}", "label": str(i), "capacity": 4} for i in range(20)]
+    w = make_world(clock, fixture(restaurants=[restaurant(tables=tables)]))
+    refs = [w.booked(table_id=f"t_{i}", at=at)["reference"]
+            for i in range(20) for at in ("18:00", "19:30", "21:00")]
+    assert all(re.fullmatch(r"[A-Z0-9]{6,12}", ref) for ref in refs)
+    assert len(set(refs)) == len(refs)

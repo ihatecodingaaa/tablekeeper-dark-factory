@@ -125,6 +125,14 @@ def local_minutes_instant(day: dt.date, minutes: int, zone: ZoneInfo) -> dt.date
     return naive.replace(tzinfo=zone, fold=0).astimezone(UTC)
 
 
+def plus_minutes(instant: dt.datetime, minutes: int) -> dt.datetime | None:
+    """instant + minutes of absolute time, or None if beyond the datetime range."""
+    try:
+        return instant + dt.timedelta(minutes=minutes)
+    except (OverflowError, ValueError):
+        return None
+
+
 def to_rfc3339(instant: dt.datetime, zone: dt.tzinfo) -> str:
     """RFC 3339 with seconds and the zone's UTC offset at that instant."""
     return instant.astimezone(zone).isoformat(timespec="seconds")

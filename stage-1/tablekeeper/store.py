@@ -23,6 +23,7 @@ REFERENCE_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 REFERENCE_LENGTH = 8
 STATUSES = ("confirmed", "cancelled")
 IDEMPOTENT_PATHS = ("/reservations", "/reservation-moves")
+_REFERENCE_RE = re.compile(r"[A-Z0-9]{6,12}")
 RESERVATION_FIELDS = ("reservation_id", "reference", "restaurant_id", "table_id",
                       "party_size", "status", "starts_at_local", "starts_at",
                       "ends_at", "created_at")
@@ -90,11 +91,11 @@ class Restaurant:
         _require(is_int(self.slot_minutes) and self.slot_minutes >= 1,
                  "slot_minutes must be a positive integer")
         self.duration_minutes = raw.get("reservation_duration_minutes")
-        _require(is_int(self.duration_minutes) and 1 <= self.duration_minutes <= 525600,
+        _require(is_int(self.duration_minutes) and self.duration_minutes >= 1,
                  "reservation_duration_minutes must be a positive integer")
         self.cutoff_minutes = raw.get("cancellation_cutoff_minutes")
-        _require(is_int(self.cutoff_minutes) and abs(self.cutoff_minutes) <= 525600,
-                 "cancellation_cutoff_minutes must be an integer")
+        _require(is_int(self.cutoff_minutes) and self.cutoff_minutes >= 0,
+                 "cancellation_cutoff_minutes must be a non-negative integer")
 
         hours = raw.get("opening_hours", [])
         _require(isinstance(hours, list), "opening_hours must be a list")
@@ -149,11 +150,17 @@ class Restaurant:
     def windows_on(self, day: dt.date) -> list[tuple[int, int]]:
         return self.windows.get(timeutil.weekday_of(day), [])
 
-    def duration(self) -> dt.timedelta:
-        return dt.timedelta(minutes=self.duration_minutes)
+    def end_of(self, start: dt.datetime) -> dt.datetime | None:
+        """start + reservation duration (absolute), None if out of datetime range."""
+        return timeutil.plus_minutes(start, self.duration_minutes)
 
-    def cutoff(self) -> dt.timedelta:
-        return dt.timedelta(minutes=self.cutoff_minutes)
+    def cutoff_passed(self, start: dt.datetime, now: dt.datetime) -> bool:
+        """R3: changes are allowed only while now < start - cutoff.
+
+        Compared as a duration, so a cutoff of any size is safe: start - cutoff
+        is never computed, and a cutoff wider than the lead time counts as passed.
+        """
+        return (start - now).total_seconds() <= self.cutoff_minutes * 60
 
 
 class Reservation:
@@ -280,7 +287,9 @@ def _resolve_times(restaurant: Restaurant, starts_at_local):
     _require(naive is not None, "starts_at_local must be YYYY-MM-DDTHH:MM")
     start = timeutil.resolve_local(naive, restaurant.zone)
     _require(start is not None, "starts_at_local does not exist in the restaurant zone")
-    return start, start + restaurant.duration()
+    end = restaurant.end_of(start)
+    _require(end is not None, "reservation end is out of range")
+    return start, end
 
 
 def prepare_fixture(fixture):
@@ -331,26 +340,28 @@ def build_from_fixture(fixture: dict, users: list[dict], hashes: list[str],
         created_default = timeutil.utc_rfc3339(now)
         for raw in reservations:
             _require(isinstance(raw, dict), "reservations entries must be objects")
-            restaurant = state.restaurants.get(raw.get("restaurant_id"))
-            _require(restaurant is not None, "seeded reservation names an unknown restaurant")
-            table_id = raw.get("table_id")
-            _require(table_id in restaurant.table_index,
-                     "seeded reservation names an unknown table")
+            # Seeds carry the POST /reservations fields plus id, reference and
+            # user_id; each stated format is enforced. Booking rules (grid, hours,
+            # capacity, overlap) are deliberately not applied to seeds.
+            restaurant_id, table_id = raw.get("restaurant_id"), raw.get("table_id")
+            _require(valid_id(restaurant_id) and restaurant_id in state.restaurants,
+                     "seeded reservation names an unknown restaurant")
+            restaurant = state.restaurants[restaurant_id]
+            _require(valid_id(table_id) and table_id in restaurant.table_index,
+                     "seeded reservation names an unknown table of that restaurant")
             party_size = raw.get("party_size")
-            _require(is_int(party_size) and party_size >= 1, "party_size must be >= 1")
+            _require(is_int(party_size) and party_size >= 1, "party_size must be an integer >= 1")
             start, end = _resolve_times(restaurant, raw.get("starts_at_local"))
             user_id = raw.get("user_id")
-            _require(valid_id(user_id), "seeded reservation user_id must be an id")
-            rid = raw.get("id")
-            if rid is None:
-                rid = state.new_reservation_id()
+            _require(isinstance(user_id, str) and user_id in state.users,
+                     "seeded reservation user_id must name a fixture user")
+            rid = raw["id"] if "id" in raw else state.new_reservation_id()
             _require(valid_id(rid) and rid not in state.reservations,
-                     "seeded reservation id must be a unique id")
-            reference = raw.get("reference")
-            if reference is None:
-                reference = state.new_reference()
-            _require(valid_id(reference) and reference not in state.references,
-                     "seeded reservation reference must be unique")
+                     "seeded reservation id must be a unique 1..64 character id")
+            reference = raw["reference"] if "reference" in raw else state.new_reference()
+            _require(isinstance(reference, str) and _REFERENCE_RE.fullmatch(reference) is not None
+                     and reference not in state.references,
+                     "seeded reservation reference must be 6..12 of A-Z0-9 and unique")
             created_at = raw.get("created_at")
             if created_at is None:
                 created_at = created_default

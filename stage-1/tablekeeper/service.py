@@ -205,7 +205,7 @@ class Service:
                 if local_text in seen:
                     continue
                 seen.add(local_text)
-                end = start + restaurant.duration()
+                end = restaurant.end_of(start)
                 free = [t["id"] for t in restaurant.tables
                         if t["capacity"] >= party_size
                         and not any(s < end and start < e for s, e in busy.get(t["id"], ()))]
@@ -219,14 +219,14 @@ class Service:
     @staticmethod
     def _slot_starts(restaurant, day: dt.date):
         """(instant, naive) of every bookable slot start on a local date (R7)."""
-        duration = restaurant.duration()
         for opens, closes in restaurant.windows_on(day):
             closes_at = timeutil.local_minutes_instant(day, closes, restaurant.zone)
             minute = opens
             while minute < closes and minute < 24 * 60:
                 naive = dt.datetime.combine(day, dt.time(minute // 60, minute % 60))
                 start = timeutil.resolve_local(naive, restaurant.zone)
-                if start is not None and start + duration <= closes_at:
+                end = restaurant.end_of(start) if start is not None else None
+                if end is not None and end <= closes_at:
                     yield start, naive
                 minute += restaurant.slot_minutes
 
@@ -279,12 +279,12 @@ class Service:
         start = timeutil.resolve_local(booking.naive, restaurant.zone)
         if start is None:
             raise ApiError(422, "invalid_local_time", "that local time does not exist")
-        end = start + restaurant.duration()
+        end = restaurant.end_of(start)
         day = booking.naive.date()
         minute = booking.naive.hour * 60 + booking.naive.minute
         fitting = [
             (opens, closes) for opens, closes in restaurant.windows_on(day)
-            if opens <= minute < closes
+            if opens <= minute < closes and end is not None
             and end <= timeutil.local_minutes_instant(day, closes, restaurant.zone)
         ]
         if not fitting:
@@ -297,7 +297,7 @@ class Service:
 
     def _check_cutoff(self, restaurant, reservation) -> None:
         """R3: allowed only while now < starts_at - cutoff (current start)."""
-        if not self._now() < reservation.start - restaurant.cutoff():
+        if restaurant.cutoff_passed(reservation.start, self._now()):
             raise ApiError(409, "cutoff_passed", "the cancellation cutoff has passed")
 
     # -- idempotency (R1) ---------------------------------------------------------
