@@ -161,11 +161,30 @@
     return labels.map(function (l) { return isNumeric(l) ? "Table " + l : l; }).join(" + ");
   }
 
-  function seats(restaurant, ids) {
+  /* Seats of a table set. `capacities` (table id -> seats) comes from the booking
+   * policy in force for the date; without it the restaurant's own tables are used. */
+  function seats(restaurant, ids, capacities) {
     return ids.reduce(function (sum, id) {
+      if (capacities && typeof capacities[id] === "number") return sum + capacities[id];
       var table = findTable(restaurant, id);
       return sum + (table && typeof table.capacity === "number" ? table.capacity : 0);
     }, 0);
+  }
+
+  /* The capacities and duration in force for a searched date. The server names the
+   * policy version per table in `explain`; version 0 is the restaurant's own setup. */
+  function termsForDate(restaurant, slots, policies) {
+    var own = { capacities: {}, durationMinutes: restaurant.reservation_duration_minutes };
+    (restaurant.tables || []).forEach(function (table) { own.capacities[table.id] = table.capacity; });
+    var first = slots.length && Array.isArray(slots[0].explain) ? slots[0].explain[0] : null;
+    var version = first ? first.policy_version : 0;
+    for (var i = 0; version && i < policies.length; i++) {
+      if (policies[i].policy_version === version) {
+        return { capacities: policies[i].capacities,
+                 durationMinutes: policies[i].reservation_duration_minutes };
+      }
+    }
+    return own;
   }
 
   function reservationTableIds(reservation) {
@@ -384,12 +403,16 @@
       searching = true;
       if (refreshing) showRefreshing();
       else renderLoading();
+      // explain=true tells us why each table is unavailable and which policy applies.
       var params = new URLSearchParams({
-        restaurant_id: query.restaurantId, date: query.date, party_size: query.partySize
+        restaurant_id: query.restaurantId, date: query.date, party_size: query.partySize,
+        explain: "true"
       });
+      var policiesPath = "/restaurants/" + encodeURIComponent(query.restaurantId) + "/policies";
       return Promise.all([
         api("GET", "/availability?" + params.toString()),
-        api("GET", "/restaurants/" + encodeURIComponent(query.restaurantId))
+        api("GET", "/restaurants/" + encodeURIComponent(query.restaurantId)),
+        api("GET", policiesPath).catch(function () { return { ok: false }; })
       ]).then(function (answers) {
         if (seq !== searchSeq) return;  // a newer search owns the screen: drop this late answer
         searching = false;
@@ -400,12 +423,17 @@
           return;
         }
         restaurantCache[query.restaurantId] = restaurant.data;
+        var slots = availability.data.slots || [];
+        var policies = answers[2].ok && answers[2].data ? answers[2].data.policies || [] : [];
+        var terms = termsForDate(restaurant.data, slots, policies);
         view = {
           query: query,
           restaurant: restaurant.data,
-          slots: availability.data.slots || [],
+          slots: slots,
           date: availability.data.date || query.date,
-          partySize: Number(query.partySize)
+          partySize: Number(query.partySize),
+          capacities: terms.capacities,
+          durationMinutes: terms.durationMinutes
         };
         renderGrid();
         announce(view.slots.length
@@ -541,7 +569,7 @@
       var columns = [h("th", { scope: "col" }, "Time")].concat(tables.map(function (table) {
         return h("th", { scope: "col" },
           h("span", { "class": "grid__table-name" }, tablesLabel(restaurant, [table.id])),
-          h("span", { "class": "grid__table-seats" }, "Seats " + table.capacity));
+          h("span", { "class": "grid__table-seats" }, "Seats " + seats(restaurant, [table.id], view.capacities)));
       }));
       if (withPairs) {
         columns.push(h("th", { scope: "col" },
@@ -577,9 +605,10 @@
       var selected = isSelected(slot, ids);
       var pair = ids.length > 1;
       var label = tablesLabel(restaurant, ids);
+      var seatCount = seats(restaurant, ids, view.capacities);
       var content = pair
         ? h("span", { "class": "cell__text" }, h("span", null, label),
-          h("span", { "class": "cell__sub" }, "Seats " + seats(restaurant, ids)))
+          h("span", { "class": "cell__sub" }, "Seats " + seatCount))
         : h("span", null, selected ? "Selected" : "Free");
       return h("button", {
         type: "button",
@@ -588,14 +617,14 @@
         "data-available": "true",
         "aria-pressed": selected ? "true" : "false",
         "aria-disabled": booking && booking.busy ? "true" : null,
-        "aria-label": label + " at " + time + (pair ? ", seats " + seats(restaurant, ids) : "") + ", free",
+        "aria-label": label + " at " + time + (pair ? ", seats " + seatCount : "") + ", free",
         onclick: function () { selectSlot(slot, ids); }
       }, icon(selected ? "check" : "plus"), content);
     }
 
     function unavailableCell(slot, table, time) {
       var yours = heldByMe(slot, table.id);
-      var tooSmall = table.capacity < view.partySize;
+      var tooSmall = !unavailableBecauseBooked(slot, table);
       var text = yours ? "Yours" : (tooSmall ? "Too small" : "Booked");
       return h("span", {
         "class": "cell " + (yours ? "cell--mine" : "cell--unavailable"),
@@ -606,9 +635,22 @@
       }, icon(yours ? "check" : "dash"), h("span", null, text));
     }
 
+    /* Why an unavailable table is unavailable, from the server's explanation: an
+     * overlapping booking reads "Booked", a capacity miss alone reads "Too small". */
+    function unavailableBecauseBooked(slot, table) {
+      var entries = Array.isArray(slot.explain) ? slot.explain : [];
+      for (var i = 0; i < entries.length; i++) {
+        if (entries[i].table_id !== table.id) continue;
+        return (entries[i].rules || []).some(function (rule) {
+          return rule.rule === "no_overlap" && rule.holds === false;
+        });
+      }
+      return seats(view.restaurant, [table.id], view.capacities) >= view.partySize;
+    }
+
     // True when a booking confirmed on this page occupies this table during this slot.
     function heldByMe(slot, tableId) {
-      var duration = (view.restaurant.reservation_duration_minutes || 0) * 60000;
+      var duration = (view.durationMinutes || view.restaurant.reservation_duration_minutes || 0) * 60000;
       var slotStart = Date.parse(slot.starts_at);
       return Object.keys(mine).some(function (reference) {
         var r = mine[reference];
@@ -672,7 +714,7 @@
       }, title,
       h("div", { "class": "booking-summary", "data-testid": "booking-summary" },
         h("p", { "class": "booking-summary__tables" },
-          tablesLabel(restaurant, ids) + " \u00b7 seats " + seats(restaurant, ids)),
+          tablesLabel(restaurant, ids) + " \u00b7 seats " + seats(restaurant, ids, view.capacities)),
         h("p", { "class": "booking-summary__when" }, whenText(slot.starts_at_local)),
         h("p", { "class": "booking-summary__where" }, restaurant.name)),
       h("div", { "class": "field" },
@@ -684,6 +726,7 @@
 
       booking = {
         restaurant: restaurant, tableIds: ids.slice(), startsAtLocal: slot.starts_at_local,
+        capacities: view.capacities,
         form: form, partyInput: partyInput, status: status, submit: submit, confirmation: confirmation,
         fingerprint: null, body: null, key: null, busy: false
       };
@@ -798,7 +841,7 @@
           return ["Just booked by someone else", label + " is no longer free at " + time +
             ". The grid has been updated: choose another table or time. Your details are kept."];
         case "party_exceeds_capacity":
-          return ["Too many guests for this table", label + " seats " + seats(r, b.tableIds) +
+          return ["Too many guests for this table", label + " seats " + seats(r, b.tableIds, b.capacities) +
             ". Choose a larger table or joined tables."];
         case "outside_opening_hours":
           return ["Outside opening hours", r.name + " can't seat a full booking at " + time + "."];
@@ -1001,6 +1044,13 @@
       });
     }
 
+    /* The cutoff this booking accepted (its terms snapshot), else the restaurant's own. */
+    function acceptedCutoff(r, restaurant) {
+      var terms = r.accepted_terms;
+      if (terms && typeof terms.cancellation_cutoff_minutes === "number") return terms.cancellation_cutoff_minutes;
+      return restaurant ? restaurant.cancellation_cutoff_minutes : null;
+    }
+
     function renderReservation(problem) {
       var r = current.reservation;
       var restaurant = current.restaurant;
@@ -1008,7 +1058,7 @@
       var confirmed = r.status === "confirmed";
       var actions;
       if (confirmed) {
-        var cutoff = restaurant ? restaurant.cancellation_cutoff_minutes : null;
+        var cutoff = acceptedCutoff(r, restaurant);
         actions = h("div", { "class": "reservation__actions" },
           h("button", {
             type: "button", "class": "button button--danger", "data-testid": "reservation-cancel-button",
@@ -1058,9 +1108,10 @@
           return;
         }
         var restaurant = current.restaurant;
+        var window_ = acceptedCutoff(r, restaurant);
         var text = res.code === "cutoff_passed"
           ? ["Too late to cancel online", "This booking starts within " + (restaurant ? restaurant.name + "'s " : "the ") +
-            "cancellation window" + (restaurant ? " of " + formatMinutes(restaurant.cancellation_cutoff_minutes) : "") +
+            "cancellation window" + (typeof window_ === "number" ? " of " + formatMinutes(window_) : "") +
             ", so it can no longer be cancelled here."]
           : ["Cancellation not made", "Tablekeeper couldn't cancel this booking. Please look it up again."];
         renderReservation(notice("error", "alert", text[0], text[1], "reservation-error"));

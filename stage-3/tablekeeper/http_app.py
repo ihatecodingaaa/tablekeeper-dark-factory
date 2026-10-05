@@ -97,6 +97,11 @@ NO_BODY = None   # any request body is ignored
 ANY_JSON = "any"   # any JSON value; the service validates its shape
 OBJECT = "object"  # must be a JSON object, otherwise 400
 
+# Authentication per endpoint: True requires a bearer token (401 otherwise),
+# False is public, OPTIONAL_AUTH passes the caller's user id or None to the
+# service, which answers 404 for anyone but the owner (never 401).
+OPTIONAL_AUTH = "optional"
+
 
 class Request:
     """What an endpoint needs from one HTTP request."""
@@ -129,7 +134,7 @@ def _import(svc, rq):
 
 # Path templates: a literal segment matches itself, None matches one non-empty
 # segment (passed to the endpoint, percent-decoded). Each method maps to
-# (endpoint, requires bearer token, body handling).
+# (endpoint, authentication, body handling).
 ROUTES = [
     (("",), {"GET": (_search_page, False, NO_BODY)}),
     (("signup",), {"GET": (lambda s, r: (200, render_page("signup")), False, NO_BODY)}),
@@ -145,6 +150,11 @@ ROUTES = [
     (("restaurants",), {"GET": (lambda s, r: (200, s.list_restaurants()), False, NO_BODY)}),
     (("restaurants", None), {
         "GET": (lambda s, r: (200, s.get_restaurant(r.params[0])), False, NO_BODY)}),
+    (("restaurants", None, "policies"), {
+        "GET": (lambda s, r: (200, s.list_policies(r.params[0])), False, NO_BODY),
+        "POST": (lambda s, r: s.publish_policy(r.user_id, r.params[0], r.idempotency_key, r.body),
+                 True, OBJECT),
+    }),
     (("availability",), {"GET": (lambda s, r: (200, s.availability(r.query)), False, NO_BODY)}),
     (("reservations",), {
         "GET": (lambda s, r: (200, s.list_reservations(r.user_id)), True, NO_BODY),
@@ -159,9 +169,20 @@ ROUTES = [
     (("reservations", None, "cancel"), {
         "POST": (lambda s, r: (200, s.cancel_reservation(r.user_id, r.params[0])),
                  True, NO_BODY)}),
+    (("reservations", None, "history"), {
+        "GET": (lambda s, r: (200, s.reservation_history(r.user_id, r.params[0])),
+                OPTIONAL_AUTH, NO_BODY)}),
+    (("reservations", None, "decision"), {
+        "GET": (lambda s, r: (200, s.reservation_decision(r.user_id, r.params[0])),
+                OPTIONAL_AUTH, NO_BODY)}),
     (("reservation-moves",), {
         "POST": (lambda s, r: s.move_reservations(r.user_id, r.idempotency_key, r.body),
                  True, OBJECT)}),
+    (("series",), {
+        "POST": (lambda s, r: s.create_series(r.user_id, r.idempotency_key, r.body),
+                 True, OBJECT)}),
+    (("series", None), {
+        "GET": (lambda s, r: (200, s.get_series(r.user_id, r.params[0])), OPTIONAL_AUTH, NO_BODY)}),
 ]
 
 
@@ -255,7 +276,9 @@ class Handler(BaseHTTPRequestHandler):
         service = self.server.service
         rq = Request(params, parse_qs(parts.query, keep_blank_values=True),
                      _header_text(self.headers.get("Idempotency-Key")))
-        if needs_auth:
+        if needs_auth == OPTIONAL_AUTH:
+            rq.user_id = service.try_authenticate(self.headers.get("Authorization"))
+        elif needs_auth:
             rq.user_id = service.authenticate(self.headers.get("Authorization"))
         if body_mode is not NO_BODY:
             rq.body = parse_json(raw)
