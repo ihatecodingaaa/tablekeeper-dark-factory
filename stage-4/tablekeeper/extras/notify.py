@@ -3,7 +3,7 @@
 Every event gets an in-app entry. If the guest prefers email or Telegram, a
 second entry is added for that channel: with no credentials in the environment
 it is delivered by deterministic simulation ("simulated"); with credentials it
-is "queued" and a daemon thread sends it OFF the service lock, then marks it
+is "queued" and a small fixed worker pool sends it OFF the service lock, then marks it
 "sent" or "failed". A delivery failure never touches a booking.
 
 Credentials come only from the environment (S4-R8):
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import smtplib
 import threading
 import urllib.request
@@ -99,10 +100,41 @@ def emit(extras, state, now, event: str, reservation, subject: str, body: str) -
     return pending
 
 
+# Real sends go through a small fixed pool fed by a bounded queue, so a slow or
+# unreachable SMTP/Telegram host can never pile up threads or block a request.
+MAX_WORKERS = 2
+QUEUE_LIMIT = 500
+_jobs: queue.Queue = queue.Queue()
+_workers: list[threading.Thread] = []
+_workers_lock = threading.Lock()
+
+
 def dispatch(svc, pending: list[dict]) -> None:
-    """Send queued entries in daemon threads, off the lock; record the outcome."""
+    """Queue real sends for the worker pool (never blocks); overflow is marked failed."""
     for job in pending:
-        threading.Thread(target=_deliver, args=(svc, job), daemon=True).start()
+        if _jobs.qsize() >= QUEUE_LIMIT:
+            _record(svc, job["id"], "failed")
+            continue
+        _ensure_workers()
+        _jobs.put((svc, job))
+
+
+def _ensure_workers() -> None:
+    with _workers_lock:
+        _workers[:] = [worker for worker in _workers if worker.is_alive()]
+        while len(_workers) < MAX_WORKERS:
+            worker = threading.Thread(target=_work, name="tablekeeper-notify", daemon=True)
+            worker.start()
+            _workers.append(worker)
+
+
+def _work() -> None:
+    while True:
+        svc, job = _jobs.get()
+        try:
+            _deliver(svc, job)
+        finally:
+            _jobs.task_done()
 
 
 def _deliver(svc, job) -> None:
@@ -111,10 +143,14 @@ def _deliver(svc, job) -> None:
         outcome = "sent"
     except Exception:  # noqa: BLE001 - any adapter failure only marks the entry
         outcome = "failed"
+    _record(svc, job["id"], outcome)
+
+
+def _record(svc, entry_id, outcome) -> None:
     from .state import get
     with svc._lock:
         for entry in get(svc._state).outbox:
-            if entry["id"] == job["id"]:
+            if entry["id"] == entry_id:
                 entry["delivery_state"] = outcome
                 break
 
