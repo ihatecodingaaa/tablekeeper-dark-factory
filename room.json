@@ -354,7 +354,7 @@
       "id": "5860be7d-707c-4b02-9a5b-bf9380b9c149",
       "insertedAt": "2026-10-05T08:25:36.046Z",
       "messageType": "tool_result",
-      "content": "{\"is_error\":false,\"name\":\"Bash\",\"output\":\"{\\\"interrupted\\\":false,\\\"isImage\\\":false,\\\"noOutputExpected\\\":false,\\\"stderr\\\":\\\"\\\",\\\"stdout\\\":\\\"pull-be96afcd7f01fdc0d25093d7 room=6c360165-caad-4a51-b242-63dc566c44cd uuid=jrx_be96afcd7f01fdc0d25093d7dd51b09b50683cb13e8e4528466730e03c7dff84 runtime_host=- provider=pull pid=- runtime=attach-inbox/attach-inbox runtime_session=- presence=live binding=bound last_seen=0s\\\\n⚠ jam 0.4.12 is available (you're on 0.4.10) — run: see https://github.com/thenvoi/homebrew-tap/releases\\\\n(inbox empty)\\\\n⚠ jam 0.4.12 is available (you're on 0.4.10) — run: see https://github.com/thenvoi/homebrew-tap/releases\\\"}\",\"tool_call_id\":\"toolu_01WZ3eJ8G7i89pveL8ipXRu2\"}",
+      "content": "{\"is_error\":false,\"name\":\"Bash\",\"output\":\"{\\\"interrupted\\\":false,\\\"isImage\\\":false,\\\"noOutputExpected\\\":false,\\\"stderr\\\":\\\"\\\",\\\"stdout\\\":\\\"pull-be96afcd7f01fdc0d25093d7 room=6c360165-caad-4a51-b242-63dc566c44cd uuid=[REDACTED] runtime_host=- provider=pull pid=- runtime=attach-inbox/attach-inbox runtime_session=- presence=live binding=bound last_seen=0s\\\\n⚠ jam 0.4.12 is available (you're on 0.4.10) — run: see https://github.com/thenvoi/homebrew-tap/releases\\\\n(inbox empty)\\\\n⚠ jam 0.4.12 is available (you're on 0.4.10) — run: see https://github.com/thenvoi/homebrew-tap/releases\\\"}\",\"tool_call_id\":\"toolu_01WZ3eJ8G7i89pveL8ipXRu2\"}",
       "threadId": null,
       "metadata": {
         "toolCallId": "toolu_01WZ3eJ8G7i89pveL8ipXRu2"
