@@ -2,7 +2,7 @@
 import pytest
 
 from httpkit import JSON_TYPE, assert_error
-from s3kit import day, local, policy_body, s3_fixture
+from s3httpkit import day, local, policy_body, s3_fixture
 
 
 @pytest.fixture

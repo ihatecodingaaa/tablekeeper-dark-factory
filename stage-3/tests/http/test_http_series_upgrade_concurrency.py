@@ -8,7 +8,7 @@ import threading
 import pytest
 
 from httpkit import assert_error
-from s3kit import day, local, s3_fixture, series_body
+from s3httpkit import day, local, s3_fixture, series_body
 
 STAGE_2 = pathlib.Path(__file__).resolve().parents[3] / "stage-2"
 

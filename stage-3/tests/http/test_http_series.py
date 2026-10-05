@@ -5,7 +5,7 @@ import datetime as dt
 import pytest
 
 from httpkit import assert_error
-from s3kit import (day, local, next_transition, offset_at, policy_body, s3_fixture,
+from s3httpkit import (day, local, next_transition, offset_at, policy_body, s3_fixture,
                    series_body)
 
 ANCHOR_DAY = 20  # days ahead: far outside every cutoff
