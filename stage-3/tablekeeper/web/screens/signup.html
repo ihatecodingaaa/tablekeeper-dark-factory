@@ -1,0 +1,25 @@
+<section class="auth-layout">
+  <div class="auth card">
+    <p class="eyebrow">Join Tablekeeper</p>
+    <h1 class="auth__title">Create your account</h1>
+    <p class="auth__lede">One account to book tables and keep track of your reservations.</p>
+    <div class="auth__messages" id="auth-messages"></div>
+    <form class="stack" id="signup-form" novalidate>
+      <div class="field">
+        <label class="field__label" for="signup-display-name">Your name</label>
+        <input class="input" id="signup-display-name" name="display_name" type="text" autocomplete="name" data-testid="signup-display-name">
+      </div>
+      <div class="field">
+        <label class="field__label" for="signup-email">Email</label>
+        <input class="input" id="signup-email" name="email" type="email" autocomplete="email" data-testid="signup-email">
+      </div>
+      <div class="field">
+        <label class="field__label" for="signup-password">Password</label>
+        <input class="input" id="signup-password" name="password" type="password" autocomplete="new-password" aria-describedby="signup-password-hint" data-testid="signup-password">
+        <p class="field__hint" id="signup-password-hint">At least 8 characters.</p>
+      </div>
+      <button class="button button--primary button--block" type="submit" data-testid="signup-submit">Create account</button>
+    </form>
+    <p class="auth__switch">Already have an account? <a href="/login">Sign in</a></p>
+  </div>
+</section>
