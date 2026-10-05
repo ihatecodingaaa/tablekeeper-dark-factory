@@ -50,6 +50,7 @@ def make_fixture() -> dict:
         "users": [
             {"id": "u_ada", "email": "ada@example.com", "password": PASSWORD, "display_name": "Ada"},
             {"id": "u_bob", "email": "bob@example.com", "password": PASSWORD, "display_name": "Bob"},
+            {"id": "u_mia", "email": "mia@example.com", "password": PASSWORD, "display_name": "Mia"},
         ],
         "restaurants": [
             {
@@ -63,6 +64,7 @@ def make_fixture() -> dict:
                     {"id": "t_garden", "label": "Garden", "capacity": 6},
                 ],
                 "combinable": [["t_1", "t_2"], ["t_2", "t_3"]],
+                "manager_user_ids": ["u_mia"],
             },
             {
                 "id": "r_hafen", "name": "Hafenblick", "timezone": "America/New_York",
