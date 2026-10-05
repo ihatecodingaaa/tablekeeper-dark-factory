@@ -126,7 +126,7 @@ def test_stage_2_export_round_trip(stage1):
     svc = upgraded(stage1)
     document = svc.export_state()
     assert document["format_version"] == 1 and document["track"] == "tablekeeper"
-    assert document["state"]["schema"] == 3
+    assert document["state"]["schema"] == 4
     again = Service(clock=Clock())
     again.import_state(json.loads(json.dumps(document)))
     assert again.export_state() == document
@@ -177,7 +177,7 @@ def _mutations(document):
         return next(r for r in state["reservations"] if len(r["table_ids"]) == 1)
 
     return [
-        edit(lambda s: s.update(schema=4)),
+        edit(lambda s: s.update(schema=5)),
         edit(lambda s: s.update(schema="2")),
         edit(lambda s: pair_res(s).update(table_ids=["t_1", "t_3"])),        # undeclared pair
         edit(lambda s: pair_res(s).update(table_ids=["t_1", "t_2", "t_3"])),

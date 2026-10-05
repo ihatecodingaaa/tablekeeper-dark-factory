@@ -8,7 +8,11 @@ import json
 
 from tablekeeper.extras import hooks, routes
 from tablekeeper.extras import state as xstate
+from tablekeeper import service as _service_module
 from tablekeeper.service import Service
+
+# True once the official write paths call the extras hooks themselves (stage 4).
+WIRED = hasattr(_service_module, "extras_hooks")
 
 UTC = dt.timezone.utc
 NOW = dt.datetime(2026, 9, 20, 10, 0, tzinfo=UTC)      # Sunday
@@ -97,20 +101,21 @@ class XWorld:
             body["table_id"] = table
         status, out = self.svc.create_reservation(user, key(), body)
         assert status == 201, out
-        self._hook("on_created", out["reference"])
+        if not WIRED:
+            self._hook("on_created", out["reference"])
         return out
 
     def amend(self, reference, change, user="u_ada"):
         before = self.svc.get_reservation(user, reference)["revision"]
         out = self.svc.amend_reservation(user, reference, change)
-        if out["revision"] != before:
+        if out["revision"] != before and not WIRED:
             self._hook("on_amended", reference)
         return out
 
     def cancel(self, reference, user="u_ada"):
         before = self.svc.get_reservation(user, reference)["revision"]
         out = self.svc.cancel_reservation(user, reference)
-        if out["revision"] != before:
+        if out["revision"] != before and not WIRED:
             self._hook("on_cancelled", reference)
         return out
 

@@ -111,7 +111,9 @@ def test_a_failing_hook_never_reaches_the_official_path(w, monkeypatch):
         assert hooks.on_created(w.svc, w.state, reservation, w.svc._now()) is None
         hooks.call("on_created", w.svc, w.state, reservation, w.svc._now())
         hooks.call("not_a_hook", w.svc, w.state)
-    assert w.extras.hook_failures == 2
+    # One failure from the wired official create (stage 4) plus the two direct calls.
+    from xkit import WIRED
+    assert w.extras.hook_failures == (3 if WIRED else 2)
     assert w.svc.get_reservation("u_ada", out["reference"]) == out
     assert w.svc.create_reservation("u_ada", "k", {"restaurant_id": "r_anker", "table_id": "t_2",
                                                    "starts_at_local": "2026-09-24T19:00",
