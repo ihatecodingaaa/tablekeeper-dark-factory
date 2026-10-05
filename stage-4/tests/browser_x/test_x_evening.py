@@ -5,7 +5,7 @@ import pytest
 from playwright.sync_api import expect
 
 from uikit import sign_in
-from xkit import booked, no_horizontal_page_scroll
+from browserxkit import booked, no_horizontal_page_scroll
 
 
 def open_evening(page, ref):

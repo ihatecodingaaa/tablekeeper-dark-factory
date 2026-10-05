@@ -3,7 +3,7 @@ import pytest
 from playwright.sync_api import expect
 
 from uikit import future_date, search, sign_in
-from xkit import booked, instant, no_horizontal_page_scroll
+from browserxkit import booked, instant, no_horizontal_page_scroll
 
 
 def hold(api, reference, token):

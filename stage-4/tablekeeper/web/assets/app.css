@@ -73,7 +73,7 @@ main:focus { outline: none; }
 .brand { display: inline-flex; align-items: center; gap: 10px; color: var(--accent); text-decoration: none; }
 .brand__mark { width: 30px; height: 30px; }
 .brand__name { font: 600 1.4rem/1 var(--serif); color: var(--ink); letter-spacing: 0.01em; }
-.site-nav { display: flex; gap: 4px; }
+.site-nav { display: flex; flex-wrap: wrap; gap: 4px; }
 .site-nav__link {
   display: inline-flex; align-items: center; min-height: 40px; padding: 6px 10px;
   border-radius: var(--radius-small); color: var(--ink-soft); font-weight: 600; text-decoration: none;

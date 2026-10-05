@@ -252,7 +252,7 @@
         if (text) {
           try { data = JSON.parse(text); } catch (e) { throw new Uncertain("unreadable"); }
         }
-        if (opts.auth && status === 401) signedOutByServer();
+        if (opts.auth && status === 401 && !opts.keepSession) signedOutByServer();
         return {
           status: status,
           ok: status >= 200 && status < 300,
@@ -308,7 +308,28 @@
         h("a", { "class": "button button--small", href: "/signup", "data-nav": "signup" }, "Sign up")
       ]);
     }
+    renderMemberNav();
     markCurrentNav();
+  }
+
+  /* Signed-in diners get their evenings and messages in the main navigation; managers
+   * (per GET /x/me) also get the control room and the recovery simulator. */
+  function renderMemberNav() {
+    var nav = document.querySelector(".site-nav");
+    if (!nav) return;
+    Array.prototype.forEach.call(nav.querySelectorAll("[data-member-nav]"), function (link) {
+      link.parentNode.removeChild(link);
+    });
+    if (!session.get()) return;
+    function link(href, name, text) {
+      return h("a", { "class": "site-nav__link", href: href, "data-nav": name, "data-member-nav": true }, text);
+    }
+    append(nav, [link("/passport", "passport", "My evenings"), link("/notifications", "notifications", "Messages")]);
+    api("GET", "/x/me", { auth: true, keepSession: true }).then(function (res) {
+      if (!res.ok || !session.get() || !(res.data.managed_restaurant_ids || []).length) return;
+      append(nav, [link("/control-room", "control-room", "Control room"), link("/simulator", "simulator", "Simulator")]);
+      markCurrentNav();
+    }, function () { /* the diner links are enough */ });
   }
 
   function markCurrentNav() {
@@ -439,6 +460,7 @@
         announce(view.slots.length
           ? "Showing " + plural(view.slots.length, "time") + " at " + view.restaurant.name + "."
           : "No bookable times on this day.");
+        if (!refreshing) showBestTimes(query);
       }, function () {
         if (seq !== searchSeq) return;
         searching = false;
@@ -664,6 +686,35 @@
 
     // ------------------------------------------------------------ booking form
 
+    /* Extras: the server's best times for this search. Picking one only brings its free
+     * cells into view; nothing is booked. Absent when x-search.js is not loaded. */
+    function showBestTimes(query) {
+      var slot = byId("best-times-slot");
+      if (!slot || !window.TKSearchExtras) return;
+      window.TKSearchExtras.bestTimes(slot, query, function (startsAtLocal) {
+        var time = timeOf(startsAtLocal);
+        var cell = results.querySelector('button.cell[data-testid$="-' + time + '"]');
+        if (!cell) {
+          announce("No table is free at " + time + " any more.");
+          return;
+        }
+        cell.scrollIntoView({ block: "center", inline: "nearest" });
+        cell.focus({ preventScroll: true });
+        announce("Free tables at " + time + ": choose one in the grid.");
+      });
+    }
+
+    /* Extras: after a 409, the closest options the refreshed grid really offers. */
+    function offerRecovery(b) {
+      if (booking !== b || !view || !window.TKSearchExtras) return;
+      var extras = window.TKSearchExtras;
+      var options = extras.closestOptions(view.slots, b.startsAtLocal, b.tableIds, 3);
+      b.status.appendChild(extras.recoveryPanel(options, function (option) {
+        return tablesLabel(view.restaurant, option.ids) + " at " + timeOf(option.slot.starts_at_local) +
+          " \u00b7 seats " + option.capacity;
+      }, function (slot, ids) { selectSlot(slot, ids); }));
+    }
+
     function selectSlot(slot, ids) {
       // While a booking request is on its way, its form stays put: switching
       // tables now would hide the outcome of a request that may have committed.
@@ -822,7 +873,9 @@
         }
         var message = bookingRefusal(b, res);
         showBookingError(b, message[0], message[1]);
-        if (res.code === "table_unavailable" && view) runSearch(view.query, true);
+        if (res.code === "table_unavailable" && view) {
+          runSearch(view.query, true).then(function () { offerRecovery(b); });
+        }
       }, function () {
         if (booking !== b) {
           noteSupersededOutcome(b, null);
@@ -916,11 +969,44 @@
           h("p", null, guests(reservation.party_size))),
         h("p", { "class": "confirmation__note" },
           "Keep this reference to look up or cancel your booking. ",
-          h("a", { href: "/lookup?reference=" + encodeURIComponent(reference) }, "Manage booking")));
+          h("a", { href: "/lookup?reference=" + encodeURIComponent(reference) }, "Manage booking"),
+          " \u00b7 ",
+          h("a", { href: "/evening/" + encodeURIComponent(reference), "data-testid": "confirmation-evening-link" },
+            "Open your evening")),
+        cancelled ? null : makeItYours(reference));
         setChildren(b.confirmation, section);
         reveal(section);
         if (view) runSearch(view.query, true);
       });
+    }
+
+    /* Extras, optional: preferences for this booking, saved through /x and never part of
+     * the official booking request. Loads the booking's current wishes before editing,
+     * because the extras API replaces the whole preferences object on save. */
+    function makeItYours(reference) {
+      var X = window.TKX;
+      if (!X) return null;
+      var path = "/x/reservations/" + encodeURIComponent(reference) + "/preferences";
+      var body = h("div", { "class": "confirmation__extras-body" });
+      var details = h("details", { "class": "confirmation__extras", "data-testid": "make-it-yours" },
+        h("summary", null, "Make it yours (optional)"), body);
+      var loaded = false;
+      details.addEventListener("toggle", function () {
+        if (!details.open || loaded) return;
+        loaded = true;
+        setChildren(body, X.loading("Loading your preferences..."));
+        X.api("GET", path).then(function (res) {
+          setChildren(body, X.prefsForm(res.ok ? res.data : null, {
+            onSave: function (prefs) {
+              return X.api("PUT", path, { body: prefs }).then(function (r) { return { ok: r.ok, message: r.message }; });
+            }
+          }));
+        }, function (err) {
+          loaded = false;
+          setChildren(body, X.failureNotice(err, "make-it-yours-error"));
+        });
+      });
+      return details;
     }
   }
 
@@ -1100,6 +1186,9 @@
         h("dd", { "data-testid": "reservation-tables" }, tablesLabel(restaurant, ids)),
         h("dt", null, "When"), h("dd", null, whenText(r.starts_at_local)),
         h("dt", null, "Guests"), h("dd", null, String(r.party_size))),
+      h("p", { "class": "reservation__evening" },
+        h("a", { href: "/evening/" + encodeURIComponent(r.reference), "data-testid": "lookup-evening-link" },
+          "Open your evening"), " for the guarantee, calendar and messages."),
       problem,
       actions));
     }

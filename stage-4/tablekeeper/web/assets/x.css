@@ -159,7 +159,12 @@
 .x-dialog__actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; margin-top: 18px; }
 
 /* Search extras: Best Times and 409 recovery */
-.x-best { padding: 18px; margin-bottom: 16px; }
+.best-times-slot:not(:empty) { margin-top: 24px; }
+.x-best { padding: 18px; }
+.confirmation__extras { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 12px; }
+.confirmation__extras summary { cursor: pointer; font-weight: 700; color: var(--accent-strong); min-height: 32px; }
+.confirmation__extras-body { margin-top: 12px; }
+.reservation__evening { margin-top: 14px; color: var(--ink-soft); }
 .x-best__list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 .x-best__item {
   width: 100%; display: grid; gap: 2px; text-align: left; padding: 10px 12px; min-height: 44px; cursor: pointer;
