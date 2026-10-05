@@ -1,0 +1,5 @@
+# Only the service is built into the image; local test runs leave bytecode behind.
+**/__pycache__
+**/*.pyc
+tests
+demo
