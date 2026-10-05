@@ -292,6 +292,7 @@ button.cell { cursor: pointer; }
 .confirmation { margin-top: 18px; padding: 20px; border-color: var(--success); }
 .confirmation:focus { outline: none; }
 .confirmation__badge { display: inline-flex; align-items: center; gap: 8px; color: var(--success); font-weight: 700; }
+.confirmation__badge--cancelled { color: var(--ink-soft); }
 .confirmation__label { margin-top: 12px; font-size: 0.85rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.1em; }
 .confirmation__reference {
   font: 700 1.8rem/1.2 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
